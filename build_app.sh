@@ -2,13 +2,12 @@
 set -euo pipefail
 
 package_root="${0:A:h}"
-repository_root="${package_root:h}"
 build_root="${package_root}/.build-release"
 output_app="${1:-${package_root}/dist/NasFinder Super Thumbnail.app}"
-icon_source="${repository_root}/NasFinder/Resources/Assets.xcassets/AppIconCyberVault.appiconset/AppIconCyberVault-1024.png"
-app_version="${APP_VERSION:-2.2.0}"
-build_number="${BUILD_NUMBER:-202608252025}"
-build_stamp="${DISPLAY_BUILD_NUMBER:-202608252025}"
+icon_source="${package_root}/Resources/AppIcon-1024.png"
+app_version="${APP_VERSION:-2.3.0}"
+build_number="${BUILD_NUMBER:-202608270616}"
+build_stamp="${DISPLAY_BUILD_NUMBER:-202608270616}"
 
 CLANG_MODULE_CACHE_PATH="${build_root}/module-cache" \
 SWIFTPM_MODULECACHE_OVERRIDE="${build_root}/module-cache" \
@@ -90,7 +89,7 @@ if [[ -n "${sparkle_public_key}" ]]; then
   plutil -insert SUPublicEDKey -string "${sparkle_public_key}" "${info_plist}"
 elif [[ -n "${SIGN_IDENTITY:-}" ]]; then
   print -u2 "Sparkle 공개키가 없어 Developer ID 배포 빌드를 중단합니다."
-  print -u2 "MacSuperThumbnail/Sparkle/sparkle_ed_public_key.txt를 추가하거나 SPARKLE_PUBLIC_KEY를 지정하세요."
+  print -u2 "Sparkle/sparkle_ed_public_key.txt를 추가하거나 SPARKLE_PUBLIC_KEY를 지정하세요."
   exit 4
 else
   print -u2 "경고: Sparkle 공개키가 없어 SUPublicEDKey를 생략합니다. 로컬/미서명 빌드에서만 허용됩니다."
