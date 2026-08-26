@@ -68,8 +68,16 @@ final class SuperThumbnailMacModel: ObservableObject {
     @Published var jobs: [SuperThumbnailJob] = []
     @Published var activeJobID: UUID? = nil
     @Published var concurrencyPreference: SuperThumbnailWorkerPreference = .auto
+    /// Current system thermal state, kept up to date via `ProcessInfo.thermalStateDidChangeNotification`.
+    @Published private(set) var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+    /// Number of file/folder items currently being processed by the active job.
+    @Published private(set) var activeWorkerCount = 0
+
+    /// Wakes the running scheduler whenever the effective worker limit may have changed.
+    let limitSignal = SuperThumbnailWorkerLimitSignal()
 
     private var task: Task<Void, Never>?
+    private var thermalObserver: NSObjectProtocol?
     private let workerID = "mac-\(UUID().uuidString)"
     private let defaults = UserDefaults.standard
 
@@ -93,6 +101,13 @@ final class SuperThumbnailMacModel: ObservableObject {
     init() {
         restoreConcurrencyPreference()
         restoreLastFolder()
+        observeThermalState()
+    }
+
+    deinit {
+        if let thermalObserver {
+            NotificationCenter.default.removeObserver(thermalObserver)
+        }
     }
 
     private func restoreConcurrencyPreference() {
@@ -102,9 +117,57 @@ final class SuperThumbnailMacModel: ObservableObject {
         }
     }
 
+    /// Applies immediately to the running job: in-flight items finish normally, the new limit
+    /// governs the next item start (raising it starts queued items right away).
     func setConcurrencyPreference(_ preference: SuperThumbnailWorkerPreference) {
         concurrencyPreference = preference
         defaults.set(preference.rawValue, forKey: "macSuperThumbnail.concurrencyPreference")
+        limitSignal.notifyChanged()
+    }
+
+    private func observeThermalState() {
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            let state = ProcessInfo.processInfo.thermalState
+            Task { @MainActor in
+                self.updateThermalState(state)
+            }
+        }
+    }
+
+    /// Updates the thermal input of the concurrency policy. The running scheduler re-evaluates its
+    /// limit on the next start and is woken up so recovery (e.g. serious → nominal) raises the
+    /// worker count back to the auto/explicit ceiling without waiting for a completion.
+    func updateThermalState(_ state: ProcessInfo.ThermalState) {
+        guard state != thermalState else { return }
+        thermalState = state
+        limitSignal.notifyChanged()
+    }
+
+    /// Effective item-level worker limit for the given storage type under the current preference and thermal state.
+    func effectiveWorkerLimit(isNetworkOrRemovable: Bool) -> Int {
+        SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(
+            preference: concurrencyPreference,
+            isNetworkOrRemovable: isNetworkOrRemovable,
+            thermalState: thermalState
+        )
+    }
+
+    /// Effective folder-level worker limit (capped at 2) for the given storage type.
+    func effectiveFolderWorkerLimit(isNetworkOrRemovable: Bool) -> Int {
+        SuperThumbnailConcurrencyPolicy.effectiveFolderWorkerLimit(
+            preference: concurrencyPreference,
+            isNetworkOrRemovable: isNetworkOrRemovable,
+            thermalState: thermalState
+        )
+    }
+
+    var isThermalThrottled: Bool {
+        SuperThumbnailConcurrencyPolicy.isThermalThrottled(thermalState: thermalState)
     }
 
     func restoreLastFolder() {
@@ -418,23 +481,8 @@ final class SuperThumbnailMacModel: ObservableObject {
         isRunning = false
         isPaused = false
         activeJobID = nil
+        activeWorkerCount = 0
         task = nil
-    }
-
-    private func currentEffectiveWorkerLimit(isNetworkOrRemovable: Bool) -> Int {
-        SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(
-            preference: concurrencyPreference,
-            isNetworkOrRemovable: isNetworkOrRemovable,
-            thermalState: ProcessInfo.processInfo.thermalState
-        )
-    }
-
-    private func currentEffectiveFolderWorkerLimit(isNetworkOrRemovable: Bool) -> Int {
-        SuperThumbnailConcurrencyPolicy.effectiveFolderWorkerLimit(
-            preference: concurrencyPreference,
-            isNetworkOrRemovable: isNetworkOrRemovable,
-            thermalState: ProcessInfo.processInfo.thermalState
-        )
     }
 
     private func processMediaFilesBounded(
@@ -446,52 +494,19 @@ final class SuperThumbnailMacModel: ObservableObject {
     ) async {
         guard !files.isEmpty else { return }
 
-        await withTaskGroup(of: MediaFileProcessingOutcome.self) { group in
-            var fileIndex = 0
-            let total = files.count
-            var inFlight = 0
-            let initialLimit = currentEffectiveWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable)
-
-            while fileIndex < total && inFlight < initialLimit {
-                let file = files[fileIndex]
-                fileIndex += 1
-                inFlight += 1
-                group.addTask {
-                    await VaultProcessor.processMediaItem(file, workerID: worker)
-                }
-            }
-
-            while inFlight > 0 {
-                guard let outcome = await group.next() else { break }
-                inFlight -= 1
-
-                if Task.isCancelled {
-                    group.cancelAll()
-                    continue
-                }
-
+        await SuperThumbnailDynamicScheduler.run(
+            items: files,
+            signal: limitSignal,
+            limit: { self.effectiveWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable) },
+            isPaused: { self.isPaused },
+            onInFlightChange: { self.activeWorkerCount = $0 },
+            work: { file in
+                await VaultProcessor.processMediaItem(file, workerID: worker)
+            },
+            onOutcome: { outcome in
                 self.applyFileOutcome(outcome, started: started, jobID: jobID)
-
-                while self.isPaused && !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(200))
-                }
-
-                if Task.isCancelled {
-                    group.cancelAll()
-                    continue
-                }
-
-                let effectiveLimit = self.currentEffectiveWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable)
-                while fileIndex < total && inFlight < effectiveLimit && !self.isPaused && !Task.isCancelled {
-                    let file = files[fileIndex]
-                    fileIndex += 1
-                    inFlight += 1
-                    group.addTask {
-                        await VaultProcessor.processMediaItem(file, workerID: worker)
-                    }
-                }
             }
-        }
+        )
     }
 
     private func applyFileOutcome(
@@ -544,35 +559,22 @@ final class SuperThumbnailMacModel: ObservableObject {
             }
             if Task.isCancelled { break }
 
-            let folderLimit = currentEffectiveFolderWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable)
-
-            await withTaskGroup(of: FolderProcessingOutcome.self) { group in
-                var folderIndex = 0
-                let total = depthGroup.count
-                var inFlight = 0
-
-                while folderIndex < total && inFlight < folderLimit {
-                    let folder = depthGroup[folderIndex]
-                    folderIndex += 1
-                    inFlight += 1
-                    group.addTask {
-                        await VaultProcessor.processFolderItem(
-                            folder,
-                            workerID: worker,
-                            tileCache: tileCache
-                        )
-                    }
-                }
-
-                while inFlight > 0 {
-                    guard let outcome = await group.next() else { break }
-                    inFlight -= 1
-
-                    if Task.isCancelled {
-                        group.cancelAll()
-                        continue
-                    }
-
+            // Depth groups are barriers: the next (shallower) group only starts after this one
+            // finishes, so parent sheets always see finished child sheets.
+            await SuperThumbnailDynamicScheduler.run(
+                items: depthGroup,
+                signal: limitSignal,
+                limit: { self.effectiveFolderWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable) },
+                isPaused: { self.isPaused },
+                onInFlightChange: { self.activeWorkerCount = $0 },
+                work: { folder in
+                    await VaultProcessor.processFolderItem(
+                        folder,
+                        workerID: worker,
+                        tileCache: tileCache
+                    )
+                },
+                onOutcome: { outcome in
                     self.applyFolderOutcome(
                         outcome,
                         started: started,
@@ -581,31 +583,8 @@ final class SuperThumbnailMacModel: ObservableObject {
                         folderEmptyCount: &folderEmptyCount,
                         folderFailedCount: &folderFailedCount
                     )
-
-                    while self.isPaused && !Task.isCancelled {
-                        try? await Task.sleep(for: .milliseconds(200))
-                    }
-
-                    if Task.isCancelled {
-                        group.cancelAll()
-                        continue
-                    }
-
-                    let currentLimit = self.currentEffectiveFolderWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable)
-                    while folderIndex < total && inFlight < currentLimit && !self.isPaused && !Task.isCancelled {
-                        let nextFolder = depthGroup[folderIndex]
-                        folderIndex += 1
-                        inFlight += 1
-                        group.addTask {
-                            await VaultProcessor.processFolderItem(
-                                nextFolder,
-                                workerID: worker,
-                                tileCache: tileCache
-                            )
-                        }
-                    }
                 }
-            }
+            )
         }
     }
 
@@ -689,6 +668,7 @@ final class SuperThumbnailMacModel: ObservableObject {
         checkedSourceBytes = 0
         thumbnailBytes = 0
         averageSecondsPerItem = 0
+        activeWorkerCount = 0
     }
 
     private func byteText(_ value: Int64) -> String {
@@ -747,17 +727,19 @@ struct SuperThumbnailMacView: View {
 
     private var concurrencySummaryText: String {
         let pref = model.concurrencyPreference
-        let isThermal = SuperThumbnailConcurrencyPolicy.isThermalThrottled(thermalState: ProcessInfo.processInfo.thermalState)
+        // While running, `selectedFolder` is the active job's root, so the storage type matches the job.
+        let isNet = model.selectedFolder.map { SuperThumbnailConcurrencyPolicy.isNetworkOrRemovable(url: $0) } ?? false
+        let limit = model.effectiveWorkerLimit(isNetworkOrRemovable: isNet)
+        var text: String
         if pref == .auto {
-            let isNet = model.selectedFolder.map { SuperThumbnailConcurrencyPolicy.isNetworkOrRemovable(url: $0) } ?? false
-            let limit = SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(
-                preference: .auto,
-                isNetworkOrRemovable: isNet
-            )
-            return isThermal ? "동시: 자동 (1개·발열 제한)" : "동시: 자동 (\(limit)개)"
+            text = model.isThermalThrottled ? "동시: 자동 (1개·발열 제한)" : "동시: 자동 (\(limit)개)"
         } else {
-            return isThermal ? "동시: \(pref.displayName) (1개·발열 제한)" : "동시: \(pref.displayName)"
+            text = model.isThermalThrottled ? "동시: \(pref.displayName) (1개·발열 제한)" : "동시: \(pref.displayName)"
         }
+        if model.isRunning {
+            text += " · 실행 \(model.activeWorkerCount)개"
+        }
+        return text
     }
 
     private var header: some View {
@@ -793,7 +775,7 @@ struct SuperThumbnailMacView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("동시 처리 작업자 수를 설정합니다. 기본값은 자동(네트워크 2, 로컬 4, 발열 시 1)입니다.")
+            .help("동시 처리 작업자 수를 설정합니다. 기본값은 자동(네트워크 2, 로컬 4, 발열 시 1)입니다. 실행 중에 바꾸면 이미 시작한 항목은 끝까지 처리하고 다음 항목부터 새 제한을 적용합니다.")
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 22)
