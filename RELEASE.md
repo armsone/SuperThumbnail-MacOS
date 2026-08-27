@@ -16,20 +16,20 @@ Sparkle 업데이트 서명에는 EdDSA 키 쌍이 필요합니다.
 ```sh
 # 1. 유니버설 앱 빌드, Sparkle 프레임워크 임베드, Info.plist 업데이터 키 삽입, 서명
 SIGN_IDENTITY="Developer ID Application: ..." \
-APP_VERSION=2.3.0 \
-BUILD_NUMBER=202608270616 \
-DISPLAY_BUILD_NUMBER=202608270616 \
+APP_VERSION=2.3.1 \
+BUILD_NUMBER=202608270910 \
+DISPLAY_BUILD_NUMBER=202608270910 \
 ./build_app.sh
 
 # 2. drag-to-Applications DMG 생성 (+ 서명 + 공증)
 SIGN_IDENTITY="Developer ID Application: ..." \
 NOTARY_PROFILE="notary-profile-name" \
-APP_VERSION=2.3.0 \
+APP_VERSION=2.3.1 \
 ./make_dmg.sh
 
 # 3. 서명된 appcast 갱신
 SPARKLE_BIN_DIR=/path/to/Sparkle-2.9.4/bin \
-APP_VERSION=2.3.0 \
+APP_VERSION=2.3.1 \
 ./make_appcast.sh
 ```
 
@@ -42,10 +42,10 @@ APP_VERSION=2.3.0 \
 ## 작업 대기열과 병렬 처리
 
 - 여러 폴더를 작업 대기열에 추가할 수 있으며 폴더 작업 자체는 충돌을 피하도록 한 번에 하나씩 처리합니다.
-- 각 폴더 내부의 미디어 파일은 앱에서 선택한 `자동 / 1 / 2 / 4 / 8개` 작업자 수로 병렬 처리합니다.
-- `자동`은 로컬 저장소에서 4개, NAS·외장 저장소에서 2개를 사용하며 시스템 발열 상태가 심각하면 1개로 제한하고, 발열이 내려가면 원래 상한으로 다시 올라갑니다.
+- 각 폴더 내부의 미디어 파일은 앱에서 `1~16개` 사이로 지정한 작업자 수만큼 병렬 처리합니다.
+- `자동`을 켜면 여유가 있을 때는 지정한 수를 사용하고, 발열이 심하면 절반으로, 위험 수준이면 1개로 줄였다가 식으면 다시 늘립니다. 자동을 꺼도 위험 수준에서는 1개로 제한합니다.
 - 작업자 수 설정이나 발열 상태가 실행 중에 바뀌면 이미 시작한 파일·폴더 작업은 취소하지 않고 끝까지 처리하며, 아직 시작하지 않은 항목부터 새 제한을 적용합니다. 제한을 높이면 대기 항목을 즉시 추가로 시작합니다.
-- 폴더 수퍼썸네일은 깊은 폴더부터 처리하고 같은 깊이에서 최대 2개까지만 병렬 처리합니다.
+- 폴더 수퍼썸네일은 깊은 폴더부터 처리하고 같은 깊이에서는 적용 중인 파일 작업자 수의 절반(최소 1개)만큼 병렬 처리합니다.
 
 ## 앱의 업데이트 동작
 

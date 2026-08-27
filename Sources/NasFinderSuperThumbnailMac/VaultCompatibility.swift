@@ -132,10 +132,19 @@ enum VaultProcessor {
     static let leaseRecordName = ".owner.json"
     static let maxPixelSize = 384
 
-    static func discoverMedia(in root: URL) throws -> [MediaFile] {
+    /// Enumerates eligible media files under `root`. `onProgress`, when given,
+    /// receives throttled live tallies from the enumeration thread: the
+    /// number of folders walked so far (same eligibility as
+    /// `discoverFolders`) and the number of media files found so far. The
+    /// final tally is always delivered before this returns normally.
+    static func discoverMedia(
+        in root: URL,
+        onProgress: MediaDiscoveryProgressHandler? = nil
+    ) throws -> [MediaFile] {
         let keys: Set<URLResourceKey> = [
             .isRegularFileKey,
             .isDirectoryKey,
+            .isSymbolicLinkKey,
             .isHiddenKey,
             .fileSizeKey,
             .nameKey,
@@ -148,12 +157,20 @@ enum VaultProcessor {
         ) else { return [] }
 
         var files: [MediaFile] = []
+        var counts = MediaDiscoveryCounts.zero
+        var throttle = MediaDiscoveryProgressThrottle()
         for case let url as URL in enumerator {
             try Task.checkCancellation()
             let values = try? url.resourceValues(forKeys: keys)
-            if values?.isDirectory == true,
-               url.lastPathComponent == NasFinderVaultCompatibility.directoryName {
-                enumerator.skipDescendants()
+            if values?.isDirectory == true {
+                if url.lastPathComponent == NasFinderVaultCompatibility.directoryName {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                if values?.isSymbolicLink != true, values?.isHidden != true {
+                    counts.folderCount += 1
+                    throttle.report(counts, to: onProgress)
+                }
                 continue
             }
             guard values?.isRegularFile == true,
@@ -166,7 +183,10 @@ enum VaultProcessor {
                     size: Int64(values?.fileSize ?? 0)
                 )
             )
+            counts.fileCount += 1
+            throttle.report(counts, to: onProgress)
         }
+        throttle.report(counts, force: true, to: onProgress)
         return files.sorted {
             $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending
         }

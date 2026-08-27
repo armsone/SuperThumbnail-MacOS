@@ -169,7 +169,15 @@ extension VaultProcessor {
     /// parents are composed after their children. The root itself is excluded
     /// because its record would live outside the selected root. Vault
     /// directories, hidden entries and symlinks are never visited.
-    static func discoverFolders(in root: URL) throws -> [FolderEntry] {
+    ///
+    /// `onProgress`, when given, receives throttled live tallies from the
+    /// enumeration thread with `folderCount` set to the folders confirmed so
+    /// far; `fileCount` is always 0 here because files are not inspected in
+    /// this pass. The final tally is always delivered before returning.
+    static func discoverFolders(
+        in root: URL,
+        onProgress: MediaDiscoveryProgressHandler? = nil
+    ) throws -> [FolderEntry] {
         let keys: Set<URLResourceKey> = [
             .isDirectoryKey,
             .isHiddenKey,
@@ -184,6 +192,8 @@ extension VaultProcessor {
 
         let rootComponentCount = root.standardizedFileURL.pathComponents.count
         var folders: [FolderEntry] = []
+        var counts = MediaDiscoveryCounts.zero
+        var throttle = MediaDiscoveryProgressThrottle()
         for case let url as URL in enumerator {
             try Task.checkCancellation()
             let values = try? url.resourceValues(forKeys: keys)
@@ -202,7 +212,10 @@ extension VaultProcessor {
             }
             let depth = url.standardizedFileURL.pathComponents.count - rootComponentCount
             folders.append(FolderEntry(url: url, depth: depth))
+            counts.folderCount += 1
+            throttle.report(counts, to: onProgress)
         }
+        throttle.report(counts, force: true, to: onProgress)
         return folders.sorted {
             if $0.depth != $1.depth { return $0.depth > $1.depth }
             return $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending

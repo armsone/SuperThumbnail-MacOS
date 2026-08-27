@@ -67,42 +67,86 @@ final class DynamicConcurrencyTests: XCTestCase {
     func testAutoModeFollowsThermalThrottleAndRecovery() async throws {
         let harness = SchedulerHarness(limit: 0)
         harness.thermalState = .nominal
+        let settings = SuperThumbnailConcurrencySettings(isAutoEnabled: true, requestedWorkerCount: 4)
         harness.limitProvider = { thermal in
-            SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(
-                preference: .auto,
-                isNetworkOrRemovable: false,
-                thermalState: thermal
-            )
+            SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(settings: settings, thermalState: thermal)
         }
-        let run = harness.run(itemCount: 8)
+        let run = harness.run(itemCount: 10)
 
-        try await waitUntil("로컬 자동 상한 4개 시작") { harness.currentInFlight == 4 }
+        try await waitUntil("요청한 4개 시작") { harness.currentInFlight == 4 }
 
-        // Serious thermal pressure: limit becomes 1, in-flight items keep running.
+        // Serious thermal pressure: limit halves to 2, in-flight items keep running.
         harness.setThermalState(.serious)
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(harness.currentInFlight, 4)
 
-        for id in 0..<3 {
+        for id in 0..<2 {
             await harness.gate.release(id)
             try await waitUntil("항목 \(id) 완료") { harness.outcomes.count == id + 1 }
-            XCTAssertEqual(harness.currentInFlight, 3 - id, "발열 제한 중에는 새 항목을 시작하지 않아야 합니다.")
+            XCTAssertEqual(harness.currentInFlight, 3 - id, "발열로 절반(2개)으로 줄면 2개 이하가 될 때까지 새 항목을 시작하지 않아야 합니다.")
         }
-        await harness.gate.release(3)
-        try await waitUntil("발열 제한 하에서 1개만 실행") {
-            harness.outcomes.count == 4 && harness.currentInFlight == 1
+        XCTAssertEqual(harness.startedItems.count, 4)
+
+        await harness.gate.release(2)
+        try await waitUntil("절반 제한(2개) 하에서 자리가 나면 1개 시작") {
+            harness.outcomes.count == 3 && harness.currentInFlight == 2
         }
         XCTAssertEqual(harness.startedItems.count, 5)
 
-        // Recovery: limit returns to 4 and queued items start right away.
+        // Critical: limit is 1, again nothing new starts until only one item remains.
+        harness.setThermalState(.critical)
+        await harness.gate.release(3)
+        try await waitUntil("항목 3 완료") { harness.outcomes.count == 4 }
+        XCTAssertEqual(harness.currentInFlight, 1, "critical 발열에서는 1개만 실행해야 합니다.")
+        XCTAssertEqual(harness.startedItems.count, 5)
+
+        // Recovery: limit returns to the requested 4 and queued items start right away.
         harness.setThermalState(.nominal)
-        try await waitUntil("자원 회복 시 자동 상한 4개로 복귀") { harness.currentInFlight == 4 }
+        try await waitUntil("자원 회복 시 요청한 4개로 복귀") { harness.currentInFlight == 4 }
         XCTAssertEqual(harness.outcomes.count, 4, "완료 없이도 즉시 추가 시작되어야 합니다.")
 
-        await harness.gate.releaseAll(count: 8)
+        await harness.gate.releaseAll(count: 10)
         await run.value
-        XCTAssertEqual(harness.outcomes.sorted(), Array(0..<8))
+        XCTAssertEqual(harness.outcomes.sorted(), Array(0..<10))
         XCTAssertEqual(harness.maxInFlight, 4)
+    }
+
+    func testManualModeKeepsRequestedUnderSeriousButDropsToOneUnderCritical() async throws {
+        let harness = SchedulerHarness(limit: 0)
+        harness.thermalState = .nominal
+        let settings = SuperThumbnailConcurrencySettings(isAutoEnabled: false, requestedWorkerCount: 3)
+        harness.limitProvider = { thermal in
+            SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(settings: settings, thermalState: thermal)
+        }
+        let run = harness.run(itemCount: 6)
+
+        try await waitUntil("요청한 3개 시작") { harness.currentInFlight == 3 }
+
+        // Serious: Auto off honors the user's number, so a completion is refilled immediately.
+        harness.setThermalState(.serious)
+        await harness.gate.release(0)
+        try await waitUntil("serious에서도 3개 유지") {
+            harness.outcomes.count == 1 && harness.currentInFlight == 3
+        }
+        XCTAssertEqual(harness.startedItems.count, 4)
+
+        // Critical is never ignored: drain down to 1.
+        harness.setThermalState(.critical)
+        await harness.gate.release(1)
+        try await waitUntil("항목 1 완료") { harness.outcomes.count == 2 }
+        XCTAssertEqual(harness.currentInFlight, 2)
+        await harness.gate.release(2)
+        try await waitUntil("항목 2 완료") { harness.outcomes.count == 3 }
+        XCTAssertEqual(harness.currentInFlight, 1, "critical에서는 자동 여부와 관계없이 1개만 실행해야 합니다.")
+        XCTAssertEqual(harness.startedItems.count, 4)
+
+        harness.setThermalState(.nominal)
+        try await waitUntil("회복 시 3개로 복귀") { harness.currentInFlight == 3 }
+
+        await harness.gate.releaseAll(count: 6)
+        await run.value
+        XCTAssertEqual(harness.outcomes.sorted(), Array(0..<6))
+        XCTAssertEqual(harness.maxInFlight, 3)
     }
 
     func testPausedBeforeStartWaitsForResumeInsteadOfFinishing() async throws {
@@ -169,47 +213,125 @@ final class DynamicConcurrencyTests: XCTestCase {
 
     // MARK: - Model wiring
 
-    func testModelThermalUpdateChangesEffectiveLimitAndWakesScheduler() {
-        withIsolatedPreference { model in
-            model.setConcurrencyPreference(.auto)
-            model.updateThermalState(.nominal)
-            let generation = model.limitSignal.generation
+    func testModelThermalUpdateChangesEffectiveLimitAndWakesScheduler() throws {
+        let (model, _) = try makeIsolatedModel()
+        model.setConcurrencySettings(SuperThumbnailConcurrencySettings(isAutoEnabled: true, requestedWorkerCount: 8))
+        model.updateThermalState(.nominal)
+        let generation = model.limitSignal.generation
 
-            XCTAssertEqual(model.effectiveWorkerLimit(isNetworkOrRemovable: false), 4)
-            XCTAssertEqual(model.effectiveWorkerLimit(isNetworkOrRemovable: true), 2)
-            XCTAssertFalse(model.isThermalThrottled)
+        XCTAssertEqual(model.effectiveWorkerLimit(), 8)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 4)
+        XCTAssertFalse(model.isThermalThrottled)
+        XCTAssertFalse(model.isReducedByThermalPressure)
 
-            model.updateThermalState(.serious)
-            XCTAssertTrue(model.isThermalThrottled)
-            XCTAssertEqual(model.effectiveWorkerLimit(isNetworkOrRemovable: false), 1)
-            XCTAssertEqual(model.effectiveFolderWorkerLimit(isNetworkOrRemovable: false), 1)
-            XCTAssertEqual(model.limitSignal.generation, generation + 1)
+        model.updateThermalState(.serious)
+        XCTAssertTrue(model.isThermalThrottled)
+        XCTAssertTrue(model.isReducedByThermalPressure)
+        XCTAssertEqual(model.effectiveWorkerLimit(), 4)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 2)
+        XCTAssertEqual(model.requestedWorkerCount, 8, "발열 조절은 표시되는 요청 개수를 바꾸지 않아야 합니다.")
+        XCTAssertEqual(model.limitSignal.generation, generation + 1)
 
-            // Same state again: no spurious wake-up.
-            model.updateThermalState(.serious)
-            XCTAssertEqual(model.limitSignal.generation, generation + 1)
+        // Same state again: no spurious wake-up.
+        model.updateThermalState(.serious)
+        XCTAssertEqual(model.limitSignal.generation, generation + 1)
 
-            // Recovery restores the auto ceiling.
-            model.updateThermalState(.nominal)
-            XCTAssertEqual(model.effectiveWorkerLimit(isNetworkOrRemovable: false), 4)
-            XCTAssertEqual(model.effectiveFolderWorkerLimit(isNetworkOrRemovable: false), 2)
-            XCTAssertEqual(model.limitSignal.generation, generation + 2)
-        }
+        model.updateThermalState(.critical)
+        XCTAssertEqual(model.effectiveWorkerLimit(), 1)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 1)
+        XCTAssertEqual(model.limitSignal.generation, generation + 2)
+
+        // Recovery restores the requested number.
+        model.updateThermalState(.nominal)
+        XCTAssertEqual(model.effectiveWorkerLimit(), 8)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 4)
+        XCTAssertFalse(model.isReducedByThermalPressure)
+        XCTAssertEqual(model.limitSignal.generation, generation + 3)
     }
 
-    func testModelPreferenceChangeWakesScheduler() {
-        withIsolatedPreference { model in
-            model.updateThermalState(.nominal)
-            let generation = model.limitSignal.generation
+    func testModelAutoOffKeepsRequestedUnderSeriousAndClampsUnderCritical() throws {
+        let (model, _) = try makeIsolatedModel()
+        model.setConcurrencySettings(SuperThumbnailConcurrencySettings(isAutoEnabled: false, requestedWorkerCount: 6))
+        model.updateThermalState(.serious)
+        XCTAssertEqual(model.effectiveWorkerLimit(), 6)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 3)
+        XCTAssertFalse(model.isReducedByThermalPressure)
 
-            model.setConcurrencyPreference(.eight)
-            XCTAssertEqual(model.effectiveWorkerLimit(isNetworkOrRemovable: true), 8)
-            XCTAssertEqual(model.limitSignal.generation, generation + 1)
+        model.updateThermalState(.critical)
+        XCTAssertEqual(model.effectiveWorkerLimit(), 1)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 1)
+        XCTAssertTrue(model.isReducedByThermalPressure)
+    }
 
-            model.setConcurrencyPreference(.one)
-            XCTAssertEqual(model.effectiveWorkerLimit(isNetworkOrRemovable: false), 1)
-            XCTAssertEqual(model.limitSignal.generation, generation + 2)
-        }
+    func testModelPlusMinusChangeOnlyRequestedNumberPersistImmediatelyAndWakeScheduler() throws {
+        let (model, defaults) = try makeIsolatedModel()
+        model.setConcurrencySettings(SuperThumbnailConcurrencySettings(isAutoEnabled: true, requestedWorkerCount: 4))
+        model.updateThermalState(.nominal)
+        let generation = model.limitSignal.generation
+
+        model.incrementRequestedWorkerCount()
+        XCTAssertEqual(model.requestedWorkerCount, 5)
+        XCTAssertTrue(model.isAutoConcurrencyEnabled, "+는 자동 플래그를 바꾸지 않아야 합니다.")
+        XCTAssertEqual(model.effectiveWorkerLimit(), 5)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 2)
+        XCTAssertEqual(model.limitSignal.generation, generation + 1)
+        XCTAssertEqual(defaults.integer(forKey: SuperThumbnailConcurrencyPersistence.requestedWorkerCountKey), 5)
+        XCTAssertEqual(defaults.bool(forKey: SuperThumbnailConcurrencyPersistence.autoEnabledKey), true)
+
+        model.decrementRequestedWorkerCount()
+        model.decrementRequestedWorkerCount()
+        XCTAssertEqual(model.requestedWorkerCount, 3)
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 1)
+        XCTAssertEqual(model.limitSignal.generation, generation + 3)
+        XCTAssertEqual(defaults.integer(forKey: SuperThumbnailConcurrencyPersistence.requestedWorkerCountKey), 3)
+
+        // Auto toggle is independent of the number and also persists immediately.
+        model.setAutoConcurrencyEnabled(false)
+        XCTAssertFalse(model.isAutoConcurrencyEnabled)
+        XCTAssertEqual(model.requestedWorkerCount, 3)
+        XCTAssertEqual(defaults.bool(forKey: SuperThumbnailConcurrencyPersistence.autoEnabledKey), false)
+        XCTAssertEqual(model.limitSignal.generation, generation + 4)
+
+        // A fresh model on the same defaults restores exactly what was persisted.
+        let restored = SuperThumbnailMacModel(defaults: defaults)
+        XCTAssertEqual(
+            restored.concurrencySettings,
+            SuperThumbnailConcurrencySettings(isAutoEnabled: false, requestedWorkerCount: 3)
+        )
+    }
+
+    func testModelPlusMinusStopAtSupportedRangeWithoutSpuriousWakeups() throws {
+        let (model, _) = try makeIsolatedModel()
+        let range = SuperThumbnailConcurrencyPolicy.supportedWorkerRange
+
+        model.setRequestedWorkerCount(range.upperBound)
+        XCTAssertFalse(model.canIncrementRequestedWorkerCount)
+        XCTAssertTrue(model.canDecrementRequestedWorkerCount)
+        let atMax = model.limitSignal.generation
+        model.incrementRequestedWorkerCount()
+        XCTAssertEqual(model.requestedWorkerCount, range.upperBound)
+        XCTAssertEqual(model.limitSignal.generation, atMax, "상한에서 +는 아무것도 바꾸지 않아야 합니다.")
+
+        model.setRequestedWorkerCount(range.lowerBound)
+        XCTAssertTrue(model.canIncrementRequestedWorkerCount)
+        XCTAssertFalse(model.canDecrementRequestedWorkerCount)
+        let atMin = model.limitSignal.generation
+        model.decrementRequestedWorkerCount()
+        XCTAssertEqual(model.requestedWorkerCount, range.lowerBound)
+        XCTAssertEqual(model.limitSignal.generation, atMin, "하한에서 −는 아무것도 바꾸지 않아야 합니다.")
+        XCTAssertEqual(model.effectiveFolderWorkerLimit(), 1, "요청 1개일 때 폴더 최소 1개")
+    }
+
+    func testModelMigratesLegacyPreferenceOnInit() throws {
+        let (_, defaults) = try makeIsolatedModel()
+        defaults.removeObject(forKey: SuperThumbnailConcurrencyPersistence.autoEnabledKey)
+        defaults.removeObject(forKey: SuperThumbnailConcurrencyPersistence.requestedWorkerCountKey)
+        defaults.set("2", forKey: SuperThumbnailConcurrencyPersistence.legacyPreferenceKey)
+
+        let model = SuperThumbnailMacModel(defaults: defaults)
+        XCTAssertFalse(model.isAutoConcurrencyEnabled)
+        XCTAssertEqual(model.requestedWorkerCount, 2)
+        XCTAssertNil(defaults.object(forKey: SuperThumbnailConcurrencyPersistence.legacyPreferenceKey))
     }
 
     // MARK: - Helpers
@@ -330,19 +452,15 @@ final class DynamicConcurrencyTests: XCTestCase {
         try await waitUntil(description, timeout: timeout) { flag.isSet }
     }
 
-    /// Runs `body` with a fresh model and restores the persisted worker preference afterwards so
-    /// tests never change the user's real setting.
-    private func withIsolatedPreference(_ body: (SuperThumbnailMacModel) -> Void) {
-        let defaults = UserDefaults.standard
-        let key = "macSuperThumbnail.concurrencyPreference"
-        let previous = defaults.string(forKey: key)
-        defer {
-            if let previous {
-                defaults.set(previous, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
-            }
+    /// Creates a model backed by a throw-away `UserDefaults` suite so tests never touch the user's
+    /// real settings (concurrency keys, last folder, …).
+    private func makeIsolatedModel() throws -> (SuperThumbnailMacModel, UserDefaults) {
+        let suite = "DynamicConcurrencyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suite)
         }
-        body(SuperThumbnailMacModel())
+        return (SuperThumbnailMacModel(defaults: defaults), defaults)
     }
 }

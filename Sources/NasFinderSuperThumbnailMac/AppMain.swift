@@ -28,16 +28,23 @@ struct NasFinderSuperThumbnailMacApp: App {
                     .disabled(true)
             }
             CommandMenu("작업") {
-                Menu("동시 작업자 수") {
-                    Picker("동시 작업자 수", selection: Binding(
-                        get: { model.concurrencyPreference },
-                        set: { model.setConcurrencyPreference($0) }
-                    )) {
-                        ForEach(SuperThumbnailWorkerPreference.allCases) { pref in
-                            Text(pref.menuTitle).tag(pref)
-                        }
-                    }
+                Toggle("동시 작업자 자동 조절", isOn: Binding(
+                    get: { model.isAutoConcurrencyEnabled },
+                    set: { model.setAutoConcurrencyEnabled($0) }
+                ))
+                Divider()
+                Button("동시 작업자 늘리기") {
+                    model.incrementRequestedWorkerCount()
                 }
+                .keyboardShortcut("]", modifiers: [.command, .option])
+                .disabled(!model.canIncrementRequestedWorkerCount)
+                Button("동시 작업자 줄이기") {
+                    model.decrementRequestedWorkerCount()
+                }
+                .keyboardShortcut("[", modifiers: [.command, .option])
+                .disabled(!model.canDecrementRequestedWorkerCount)
+                Button(model.concurrencyMenuStatusText) {}
+                    .disabled(true)
             }
         }
     }
@@ -53,6 +60,9 @@ final class SuperThumbnailMacModel: ObservableObject {
     @Published var hasPendingResume = false
     @Published var cleanupPhase: VaultCleanupPhase = .idle
     @Published var discoveryPhase: MediaDiscoveryPhase = .idle
+    /// Live folder/file tallies while `discoveryPhase` is active; holds the
+    /// final tally once discovery finishes.
+    @Published private(set) var discoveryCounts = MediaDiscoveryCounts.zero
     @Published var totalCount = 0
     @Published var completedCount = 0
     @Published var generatedCount = 0
@@ -67,7 +77,8 @@ final class SuperThumbnailMacModel: ObservableObject {
     @Published var previewItems: [SuperThumbnailMacPreviewItem] = []
     @Published var jobs: [SuperThumbnailJob] = []
     @Published var activeJobID: UUID? = nil
-    @Published var concurrencyPreference: SuperThumbnailWorkerPreference = .auto
+    /// User-facing concurrency settings (Auto flag + requested worker number). Persisted on every change.
+    @Published private(set) var concurrencySettings: SuperThumbnailConcurrencySettings = .defaultSettings()
     /// Current system thermal state, kept up to date via `ProcessInfo.thermalStateDidChangeNotification`.
     @Published private(set) var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
     /// Number of file/folder items currently being processed by the active job.
@@ -77,9 +88,12 @@ final class SuperThumbnailMacModel: ObservableObject {
     let limitSignal = SuperThumbnailWorkerLimitSignal()
 
     private var task: Task<Void, Never>?
+    /// Bumped whenever a job starts discovery so progress reports that were
+    /// still in flight for an earlier (finished or cancelled) run are ignored.
+    private var discoveryRunID: UInt64 = 0
     private var thermalObserver: NSObjectProtocol?
     private let workerID = "mac-\(UUID().uuidString)"
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     var progress: Double {
         totalCount > 0 ? Double(completedCount) / Double(totalCount) : 0
@@ -98,8 +112,9 @@ final class SuperThumbnailMacModel: ObservableObject {
     var checkedDataText: String { byteText(checkedSourceBytes) + " / " + byteText(totalSourceBytes) }
     var thumbnailDataText: String { byteText(thumbnailBytes) }
 
-    init() {
-        restoreConcurrencyPreference()
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        restoreConcurrencySettings()
         restoreLastFolder()
         observeThermalState()
     }
@@ -110,19 +125,68 @@ final class SuperThumbnailMacModel: ObservableObject {
         }
     }
 
-    private func restoreConcurrencyPreference() {
-        if let raw = defaults.string(forKey: "macSuperThumbnail.concurrencyPreference"),
-           let pref = SuperThumbnailWorkerPreference(rawValue: raw) {
-            concurrencyPreference = pref
-        }
+    /// Loads the stored settings, migrating the legacy `concurrencyPreference` picker value if needed.
+    private func restoreConcurrencySettings() {
+        concurrencySettings = SuperThumbnailConcurrencyPersistence.load(from: defaults)
+    }
+
+    // MARK: - Concurrency controls
+
+    var isAutoConcurrencyEnabled: Bool { concurrencySettings.isAutoEnabled }
+    var requestedWorkerCount: Int { concurrencySettings.requestedWorkerCount }
+
+    var canIncrementRequestedWorkerCount: Bool {
+        requestedWorkerCount < SuperThumbnailConcurrencyPolicy.supportedWorkerRange.upperBound
+    }
+
+    var canDecrementRequestedWorkerCount: Bool {
+        requestedWorkerCount > SuperThumbnailConcurrencyPolicy.supportedWorkerRange.lowerBound
     }
 
     /// Applies immediately to the running job: in-flight items finish normally, the new limit
-    /// governs the next item start (raising it starts queued items right away).
-    func setConcurrencyPreference(_ preference: SuperThumbnailWorkerPreference) {
-        concurrencyPreference = preference
-        defaults.set(preference.rawValue, forKey: "macSuperThumbnail.concurrencyPreference")
+    /// governs the next item start (raising it starts queued items right away). Persists at once.
+    func setConcurrencySettings(_ settings: SuperThumbnailConcurrencySettings) {
+        guard settings != concurrencySettings else { return }
+        concurrencySettings = settings
+        SuperThumbnailConcurrencyPersistence.save(settings, to: defaults)
         limitSignal.notifyChanged()
+    }
+
+    func setAutoConcurrencyEnabled(_ isEnabled: Bool) {
+        var settings = concurrencySettings
+        settings.isAutoEnabled = isEnabled
+        setConcurrencySettings(settings)
+    }
+
+    /// Sets only the requested number (clamped to the supported range); the Auto flag is untouched.
+    func setRequestedWorkerCount(_ count: Int) {
+        setConcurrencySettings(
+            SuperThumbnailConcurrencySettings(
+                isAutoEnabled: concurrencySettings.isAutoEnabled,
+                requestedWorkerCount: count
+            )
+        )
+    }
+
+    func incrementRequestedWorkerCount() {
+        setRequestedWorkerCount(requestedWorkerCount + 1)
+    }
+
+    func decrementRequestedWorkerCount() {
+        setRequestedWorkerCount(requestedWorkerCount - 1)
+    }
+
+    /// Status line for the command menu (disabled item), e.g. "현재 6개 · 발열로 3개 적용".
+    var concurrencyMenuStatusText: String {
+        let effective = effectiveWorkerLimit()
+        var text = "요청 \(requestedWorkerCount)개 · 폴더 \(effectiveFolderWorkerLimit())개"
+        if isReducedByThermalPressure {
+            text += " · 발열로 \(effective)개 적용"
+        }
+        if isRunning {
+            text += " · 실행 \(activeWorkerCount)개"
+        }
+        return text
     }
 
     private func observeThermalState() {
@@ -148,26 +212,33 @@ final class SuperThumbnailMacModel: ObservableObject {
         limitSignal.notifyChanged()
     }
 
-    /// Effective item-level worker limit for the given storage type under the current preference and thermal state.
-    func effectiveWorkerLimit(isNetworkOrRemovable: Bool) -> Int {
+    /// Effective item-level (file) worker limit under the current settings and thermal state.
+    /// Storage type (NAS/local) does not change the limit.
+    func effectiveWorkerLimit() -> Int {
         SuperThumbnailConcurrencyPolicy.effectiveWorkerLimit(
-            preference: concurrencyPreference,
-            isNetworkOrRemovable: isNetworkOrRemovable,
+            settings: concurrencySettings,
             thermalState: thermalState
         )
     }
 
-    /// Effective folder-level worker limit (capped at 2) for the given storage type.
-    func effectiveFolderWorkerLimit(isNetworkOrRemovable: Bool) -> Int {
+    /// Effective folder-level worker limit: half of the effective file limit (remainder dropped), minimum 1.
+    func effectiveFolderWorkerLimit() -> Int {
         SuperThumbnailConcurrencyPolicy.effectiveFolderWorkerLimit(
-            preference: concurrencyPreference,
-            isNetworkOrRemovable: isNetworkOrRemovable,
+            settings: concurrencySettings,
             thermalState: thermalState
         )
     }
 
     var isThermalThrottled: Bool {
         SuperThumbnailConcurrencyPolicy.isThermalThrottled(thermalState: thermalState)
+    }
+
+    /// True only when the thermal state actually lowers the effective limit below the requested number.
+    var isReducedByThermalPressure: Bool {
+        SuperThumbnailConcurrencyPolicy.isReducedByThermalPressure(
+            settings: concurrencySettings,
+            thermalState: thermalState
+        )
     }
 
     func restoreLastFolder() {
@@ -328,7 +399,6 @@ final class SuperThumbnailMacModel: ObservableObject {
             }
 
             status = job.isFresh ? "기존 .NasFinder-Vault 보관본을 정리하는 중…" : "사진과 영상을 찾는 중…"
-            let isNetworkOrRemovable = SuperThumbnailConcurrencyPolicy.isNetworkOrRemovable(url: root)
 
             do {
                 // 1. Fresh Cleanup Phase if requested
@@ -363,10 +433,14 @@ final class SuperThumbnailMacModel: ObservableObject {
                 }
 
                 // 2. Discovery Phase
+                discoveryRunID &+= 1
+                let runID = discoveryRunID
+                discoveryCounts = .zero
                 discoveryPhase = .discoveringFiles
                 currentName = "사진과 영상을 찾는 중입니다."
+                let reportFiles = makeDiscoveryProgressHandler(phase: .discoveringFiles, runID: runID)
                 let mediaDiscovery = Task.detached(priority: .userInitiated) {
-                    try VaultProcessor.discoverMedia(in: root)
+                    try VaultProcessor.discoverMedia(in: root, onProgress: reportFiles)
                 }
                 let files = try await withTaskCancellationHandler {
                     try await mediaDiscovery.value
@@ -374,10 +448,12 @@ final class SuperThumbnailMacModel: ObservableObject {
                     mediaDiscovery.cancel()
                 }
                 try Task.checkCancellation()
+                discoveryCounts.fileCount = files.count
 
                 discoveryPhase = .discoveringFolders
+                let reportFolders = makeDiscoveryProgressHandler(phase: .discoveringFolders, runID: runID)
                 let folderDiscovery = Task.detached(priority: .userInitiated) {
-                    try VaultProcessor.discoverFolders(in: root)
+                    try VaultProcessor.discoverFolders(in: root, onProgress: reportFolders)
                 }
                 let folders = try await withTaskCancellationHandler {
                     try await folderDiscovery.value
@@ -385,6 +461,7 @@ final class SuperThumbnailMacModel: ObservableObject {
                     folderDiscovery.cancel()
                 }
                 try Task.checkCancellation()
+                discoveryCounts = MediaDiscoveryCounts(folderCount: folders.count, fileCount: files.count)
                 discoveryPhase = .idle
 
                 totalCount = files.count + folders.count
@@ -417,7 +494,6 @@ final class SuperThumbnailMacModel: ObservableObject {
                     files: files,
                     worker: worker,
                     started: started,
-                    isNetworkOrRemovable: isNetworkOrRemovable,
                     jobID: job.id
                 )
                 try Task.checkCancellation()
@@ -434,7 +510,6 @@ final class SuperThumbnailMacModel: ObservableObject {
                     worker: worker,
                     tileCache: folderTileCache,
                     started: started,
-                    isNetworkOrRemovable: isNetworkOrRemovable,
                     jobID: job.id,
                     folderGeneratedCount: &folderGeneratedCount,
                     folderEmptyCount: &folderEmptyCount,
@@ -489,7 +564,6 @@ final class SuperThumbnailMacModel: ObservableObject {
         files: [MediaFile],
         worker: String,
         started: Date,
-        isNetworkOrRemovable: Bool,
         jobID: UUID
     ) async {
         guard !files.isEmpty else { return }
@@ -497,7 +571,7 @@ final class SuperThumbnailMacModel: ObservableObject {
         await SuperThumbnailDynamicScheduler.run(
             items: files,
             signal: limitSignal,
-            limit: { self.effectiveWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable) },
+            limit: { self.effectiveWorkerLimit() },
             isPaused: { self.isPaused },
             onInFlightChange: { self.activeWorkerCount = $0 },
             work: { file in
@@ -546,7 +620,6 @@ final class SuperThumbnailMacModel: ObservableObject {
         worker: String,
         tileCache: FolderSheetTileCache,
         started: Date,
-        isNetworkOrRemovable: Bool,
         jobID: UUID,
         folderGeneratedCount: inout Int,
         folderEmptyCount: inout Int,
@@ -564,7 +637,7 @@ final class SuperThumbnailMacModel: ObservableObject {
             await SuperThumbnailDynamicScheduler.run(
                 items: depthGroup,
                 signal: limitSignal,
-                limit: { self.effectiveFolderWorkerLimit(isNetworkOrRemovable: isNetworkOrRemovable) },
+                limit: { self.effectiveFolderWorkerLimit() },
                 isPaused: { self.isPaused },
                 onInFlightChange: { self.activeWorkerCount = $0 },
                 work: { folder in
@@ -629,6 +702,37 @@ final class SuperThumbnailMacModel: ObservableObject {
         }
     }
 
+    /// Builds the callback handed to a discovery pass. It is invoked on the
+    /// enumeration thread (already throttled there) and hops to the main
+    /// actor once per delivered tally.
+    private func makeDiscoveryProgressHandler(
+        phase: MediaDiscoveryPhase,
+        runID: UInt64
+    ) -> MediaDiscoveryProgressHandler {
+        { [weak self] counts in
+            Task { @MainActor in
+                self?.applyDiscoveryProgress(counts, phase: phase, runID: runID)
+            }
+        }
+    }
+
+    /// Applies a throttled tally from a discovery pass. Reports are dropped
+    /// when they belong to another run or a phase that already ended, and
+    /// merged with `max` so the display never moves backwards within a run
+    /// (the folder pass reports `fileCount == 0`, which leaves the file total
+    /// from the file pass untouched).
+    private func applyDiscoveryProgress(
+        _ counts: MediaDiscoveryCounts,
+        phase: MediaDiscoveryPhase,
+        runID: UInt64
+    ) {
+        guard runID == discoveryRunID, discoveryPhase == phase else { return }
+        let merged = discoveryCounts.merging(counts)
+        if merged != discoveryCounts {
+            discoveryCounts = merged
+        }
+    }
+
     private func addPreviewItem(_ item: SuperThumbnailMacPreviewItem, isNewlyGenerated: Bool) {
         previewItems = SuperThumbnailPreviewOrdering.prepending(
             item,
@@ -659,6 +763,7 @@ final class SuperThumbnailMacModel: ObservableObject {
     private func resetProgress() {
         cleanupPhase = .idle
         discoveryPhase = .idle
+        discoveryCounts = .zero
         totalCount = 0
         completedCount = 0
         generatedCount = 0
@@ -725,21 +830,72 @@ struct SuperThumbnailMacView: View {
         }
     }
 
+    /// Live status next to the −/+ controls. Kept separate from the controls themselves so state
+    /// updates only re-render this text and never the buttons' identity/focus.
     private var concurrencySummaryText: String {
-        let pref = model.concurrencyPreference
-        // While running, `selectedFolder` is the active job's root, so the storage type matches the job.
-        let isNet = model.selectedFolder.map { SuperThumbnailConcurrencyPolicy.isNetworkOrRemovable(url: $0) } ?? false
-        let limit = model.effectiveWorkerLimit(isNetworkOrRemovable: isNet)
-        var text: String
-        if pref == .auto {
-            text = model.isThermalThrottled ? "동시: 자동 (1개·발열 제한)" : "동시: 자동 (\(limit)개)"
-        } else {
-            text = model.isThermalThrottled ? "동시: \(pref.displayName) (1개·발열 제한)" : "동시: \(pref.displayName)"
+        var parts: [String] = ["폴더 \(model.effectiveFolderWorkerLimit())개"]
+        if model.isReducedByThermalPressure {
+            parts.append("발열로 \(model.effectiveWorkerLimit())개 적용")
         }
         if model.isRunning {
-            text += " · 실행 \(model.activeWorkerCount)개"
+            parts.append("실행 \(model.activeWorkerCount)개")
         }
-        return text
+        return parts.joined(separator: " · ")
+    }
+
+    private var concurrencyHelpText: String {
+        "동시 처리 작업자 수입니다. −/+로 원하는 개수를 정하고(1~\(SuperThumbnailConcurrencyPolicy.supportedWorkerRange.upperBound)개), "
+            + "‘자동’을 켜면 여유가 있을 때는 그 개수를 그대로 쓰고 발열이 심하면 절반으로, 위험 수준이면 1개로 줄였다가 식으면 다시 늘립니다. "
+            + "‘자동’을 끄면 위험 수준 발열(1개)을 제외하고 정한 개수를 그대로 씁니다. "
+            + "폴더 처리는 파일 동시 수의 절반(최소 1개)입니다. 실행 중에 바꾸면 이미 시작한 항목은 끝까지 처리하고 다음 항목부터 적용됩니다."
+    }
+
+    private var concurrencyControls: some View {
+        HStack(spacing: 10) {
+            Toggle("자동", isOn: Binding(
+                get: { model.isAutoConcurrencyEnabled },
+                set: { model.setAutoConcurrencyEnabled($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .accessibilityLabel("동시 작업자 자동 조절")
+
+            HStack(spacing: 4) {
+                Button {
+                    model.decrementRequestedWorkerCount()
+                } label: {
+                    Image(systemName: "minus")
+                        .frame(width: 14, height: 14)
+                }
+                .disabled(!model.canDecrementRequestedWorkerCount)
+                .accessibilityLabel("동시 작업자 줄이기")
+
+                Text("\(model.requestedWorkerCount)개")
+                    .font(.body.monospacedDigit())
+                    .frame(minWidth: 34)
+                    .accessibilityLabel("요청 동시 작업자 \(model.requestedWorkerCount)개")
+
+                Button {
+                    model.incrementRequestedWorkerCount()
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 14, height: 14)
+                }
+                .disabled(!model.canIncrementRequestedWorkerCount)
+                .accessibilityLabel("동시 작업자 늘리기")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Text(concurrencySummaryText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+        .fixedSize()
+        .help(concurrencyHelpText)
     }
 
     private var header: some View {
@@ -753,29 +909,10 @@ struct SuperThumbnailMacView: View {
                 Text("Super Thumbnail for Mac").foregroundStyle(.secondary)
             }
             Spacer()
-            Menu {
-                Picker("동시 작업 수", selection: Binding(
-                    get: { model.concurrencyPreference },
-                    set: { model.setConcurrencyPreference($0) }
-                )) {
-                    ForEach(SuperThumbnailWorkerPreference.allCases) { pref in
-                        Text(pref.menuTitle).tag(pref)
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "cpu")
-                    Text(concurrencySummaryText)
-                }
-                .font(.caption)
+            Image(systemName: "cpu")
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("동시 처리 작업자 수를 설정합니다. 기본값은 자동(네트워크 2, 로컬 4, 발열 시 1)입니다. 실행 중에 바꾸면 이미 시작한 항목은 끝까지 처리하고 다음 항목부터 새 제한을 적용합니다.")
+                .accessibilityHidden(true)
+            concurrencyControls
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 22)
@@ -964,17 +1101,27 @@ struct SuperThumbnailMacView: View {
                 .progressViewStyle(.linear)
                 .tint(.blue)
                 .scaleEffect(y: 1.6)
-            Text(model.discoveryPhase.activityText)
-                .font(.body.weight(.medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.discoveryPhase)
+            HStack(spacing: 12) {
+                Text(model.discoveryPhase.activityText)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.discoveryPhase)
+                Spacer(minLength: 8)
+                Text(model.discoveryCounts.countText)
+                    .font(.body.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .contentTransition(.numericText())
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: model.discoveryCounts)
+            }
         }
         .padding(20)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(model.discoveryPhase.accessibilityLabelText)
-        .accessibilityValue(model.discoveryPhase.accessibilityValueText)
+        .accessibilityValue(model.discoveryPhase.accessibilityValueText(with: model.discoveryCounts))
     }
 
     private var progressCard: some View {

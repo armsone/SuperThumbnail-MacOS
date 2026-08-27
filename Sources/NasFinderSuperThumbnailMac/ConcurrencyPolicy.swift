@@ -2,69 +2,71 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// Concurrency preference selectable by the user.
-/// - auto: Conservative limit based on storage type (network/removable: 2, local fixed: 4) and thermal state.
-/// - explicit (1, 2, 4, 8): Fixed upper bound, dynamically clamped to 1 under serious/critical thermal pressure.
+/// User-facing concurrency settings.
 ///
-/// Changing the preference (or the thermal state) while a job is running is applied to the
-/// *next* item start only: in-flight items always finish normally, so source media is never
-/// left in a half-processed state. See `SuperThumbnailDynamicScheduler`.
-enum SuperThumbnailWorkerPreference: String, CaseIterable, Identifiable, Sendable, Codable {
-    case auto = "auto"
-    case one = "1"
-    case two = "2"
-    case four = "4"
-    case eight = "8"
+/// - `requestedWorkerCount`: the number shown in the UI and adjusted with the −/+ buttons. It is
+///   always the *ceiling* the user asked for, regardless of Auto.
+/// - `isAutoEnabled`: when on, the app still targets `requestedWorkerCount` while the machine has
+///   capacity but automatically lowers the *effective* number under thermal pressure and raises it
+///   back when pressure clears. When off, the requested number is honored as-is except under
+///   `.critical` pressure (see `SuperThumbnailConcurrencyPolicy`).
+///
+/// Changing either value (or the thermal state) while a job is running is applied to the *next*
+/// item start only: in-flight items always finish normally, so source media is never left in a
+/// half-processed state. See `SuperThumbnailDynamicScheduler`.
+struct SuperThumbnailConcurrencySettings: Equatable, Sendable {
+    var isAutoEnabled: Bool
+    var requestedWorkerCount: Int
 
-    var id: String { rawValue }
-
-    var explicitCount: Int? {
-        switch self {
-        case .auto: return nil
-        case .one: return 1
-        case .two: return 2
-        case .four: return 4
-        case .eight: return 8
-        }
+    init(isAutoEnabled: Bool, requestedWorkerCount: Int) {
+        self.isAutoEnabled = isAutoEnabled
+        self.requestedWorkerCount = SuperThumbnailConcurrencyPolicy.clampRequestedWorkerCount(requestedWorkerCount)
     }
 
-    var displayName: String {
-        switch self {
-        case .auto:
-            return "자동"
-        case .one:
-            return "1개"
-        case .two:
-            return "2개"
-        case .four:
-            return "4개"
-        case .eight:
-            return "8개"
-        }
-    }
-
-    var menuTitle: String {
-        switch self {
-        case .auto:
-            return "자동 (저장소 및 발열에 맞춤)"
-        case .one:
-            return "1개 (순차 처리)"
-        case .two:
-            return "2개 작업자"
-        case .four:
-            return "4개 작업자"
-        case .eight:
-            return "8개 작업자"
-        }
+    /// Auto on with the processor-derived default requested number.
+    static func defaultSettings(
+        activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount
+    ) -> SuperThumbnailConcurrencySettings {
+        SuperThumbnailConcurrencySettings(
+            isAutoEnabled: true,
+            requestedWorkerCount: SuperThumbnailConcurrencyPolicy.defaultRequestedWorkerCount(
+                activeProcessorCount: activeProcessorCount
+            )
+        )
     }
 }
 
 /// Pure policy functions and helpers for concurrency limits and storage/thermal detection.
+///
+/// Policy contract (file-level, i.e. photo/video items):
+/// - No pressure (`.nominal` / `.fair`): effective = requested (Auto on or off).
+/// - `.serious`: Auto on → effective = max(1, requested / 2); Auto off → requested (user's choice).
+/// - `.critical`: effective = 1 regardless of Auto. Critical pressure is never ignored.
+///
+/// Folder contract: effective folder limit = max(1, effective file limit / 2), remainder dropped.
+/// The same rule applies to NAS/network, removable and local volumes. Because a running worker
+/// pool cannot use 0, a requested value of 1 (or 2, or 3) gives a folder limit of 1 — this is the
+/// minimum safe effective folder limit (`minimumFolderWorkerLimit`).
 enum SuperThumbnailConcurrencyPolicy {
-    static let autoLocalWorkerLimit = 4
-    static let autoRemoteOrRemovableWorkerLimit = 2
-    static let maxFolderWorkers = 2
-    static let thermalThrottledWorkerLimit = 1
+    /// Full user-selectable range of the requested worker number.
+    static let supportedWorkerRange: ClosedRange<Int> = 1...16
+    /// Effective file limit whenever thermal state is `.critical` (Auto on or off).
+    static let criticalThermalWorkerLimit = 1
+    /// Lowest possible folder limit; used when half of the file limit would round down to 0.
+    static let minimumFolderWorkerLimit = 1
+
+    /// Processor-derived default requested number: one worker per active core, clamped to the
+    /// supported range. Auto never keeps the number artificially low — under no pressure the full
+    /// requested number is used.
+    static func defaultRequestedWorkerCount(
+        activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount
+    ) -> Int {
+        clampRequestedWorkerCount(activeProcessorCount)
+    }
+
+    static func clampRequestedWorkerCount(_ value: Int) -> Int {
+        min(max(value, supportedWorkerRange.lowerBound), supportedWorkerRange.upperBound)
+    }
 
     /// Detects if a URL is on a network volume or removable storage.
     static func isNetworkOrRemovable(url: URL) -> Bool {
@@ -79,58 +81,122 @@ enum SuperThumbnailConcurrencyPolicy {
         return false
     }
 
-    /// Base worker count before thermal pressure is applied.
-    static func baseWorkerLimit(
-        preference: SuperThumbnailWorkerPreference,
-        isNetworkOrRemovable: Bool
-    ) -> Int {
-        switch preference {
-        case .auto:
-            return isNetworkOrRemovable ? autoRemoteOrRemovableWorkerLimit : autoLocalWorkerLimit
-        case .one:
-            return 1
-        case .two:
-            return 2
-        case .four:
-            return 4
-        case .eight:
-            return 8
-        }
-    }
-
     /// Whether the system is under serious or critical thermal pressure.
     static func isThermalThrottled(thermalState: ProcessInfo.ThermalState) -> Bool {
         thermalState == .serious || thermalState == .critical
     }
 
-    /// Effective worker limit for item-level processing.
-    /// Clamps to 1 if thermal state is serious or critical.
-    static func effectiveWorkerLimit(
-        preference: SuperThumbnailWorkerPreference,
-        isNetworkOrRemovable: Bool,
-        thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
-    ) -> Int {
-        if isThermalThrottled(thermalState: thermalState) {
-            return thermalThrottledWorkerLimit
-        }
-        let base = baseWorkerLimit(preference: preference, isNetworkOrRemovable: isNetworkOrRemovable)
-        return max(1, base)
+    /// Whether the given settings/thermal combination actually lowers the effective file limit
+    /// below the requested number.
+    static func isReducedByThermalPressure(
+        settings: SuperThumbnailConcurrencySettings,
+        thermalState: ProcessInfo.ThermalState
+    ) -> Bool {
+        effectiveWorkerLimit(settings: settings, thermalState: thermalState) < settings.requestedWorkerCount
     }
 
-    /// Effective worker limit for folder processing within a single depth group.
-    /// Deepest depth first; within one depth allows bounded concurrency capped at 2.
-    /// Clamped to 1 under thermal pressure.
-    static func effectiveFolderWorkerLimit(
-        preference: SuperThumbnailWorkerPreference,
-        isNetworkOrRemovable: Bool,
+    /// Effective worker limit for item-level (file) processing. See the type documentation for the
+    /// exact thermal rules. Always ≥ 1.
+    static func effectiveWorkerLimit(
+        settings: SuperThumbnailConcurrencySettings,
         thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
     ) -> Int {
-        let itemLimit = effectiveWorkerLimit(
-            preference: preference,
-            isNetworkOrRemovable: isNetworkOrRemovable,
-            thermalState: thermalState
+        let requested = clampRequestedWorkerCount(settings.requestedWorkerCount)
+        switch thermalState {
+        case .critical:
+            return criticalThermalWorkerLimit
+        case .serious:
+            return settings.isAutoEnabled ? max(1, requested / 2) : requested
+        case .nominal, .fair:
+            return requested
+        @unknown default:
+            // Treat unknown future states conservatively, like `.serious`.
+            return settings.isAutoEnabled ? max(1, requested / 2) : requested
+        }
+    }
+
+    /// Effective worker limit for folder processing within a single depth group:
+    /// half of the effective file limit with the remainder dropped, never below
+    /// `minimumFolderWorkerLimit`. Storage type does not change this value.
+    static func effectiveFolderWorkerLimit(
+        settings: SuperThumbnailConcurrencySettings,
+        thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+    ) -> Int {
+        folderWorkerLimit(fileWorkerLimit: effectiveWorkerLimit(settings: settings, thermalState: thermalState))
+    }
+
+    /// Folder limit derived from a file limit: `max(1, fileWorkerLimit / 2)`.
+    static func folderWorkerLimit(fileWorkerLimit: Int) -> Int {
+        max(minimumFolderWorkerLimit, fileWorkerLimit / 2)
+    }
+}
+
+/// Persistence of `SuperThumbnailConcurrencySettings` in `UserDefaults`, including a one-time
+/// migration of the legacy `macSuperThumbnail.concurrencyPreference` picker value.
+enum SuperThumbnailConcurrencyPersistence {
+    static let legacyPreferenceKey = "macSuperThumbnail.concurrencyPreference"
+    static let autoEnabledKey = "macSuperThumbnail.concurrencyAutoEnabled"
+    static let requestedWorkerCountKey = "macSuperThumbnail.requestedWorkerCount"
+
+    /// Maps a legacy picker raw value to the new settings, preserving the user's intent:
+    /// - `"auto"` → Auto on, processor-derived default requested number.
+    /// - `"1"`, `"2"`, `"4"`, `"8"` (any integer string) → Auto off, requested = that number (clamped).
+    /// - anything else → `nil` (caller falls back to defaults).
+    static func migrateLegacyPreference(
+        rawValue: String?,
+        activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount
+    ) -> SuperThumbnailConcurrencySettings? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !rawValue.isEmpty else {
+            return nil
+        }
+        if rawValue.lowercased() == "auto" {
+            return .defaultSettings(activeProcessorCount: activeProcessorCount)
+        }
+        if let count = Int(rawValue) {
+            return SuperThumbnailConcurrencySettings(isAutoEnabled: false, requestedWorkerCount: count)
+        }
+        return nil
+    }
+
+    /// Loads the settings. If the new keys are absent, migrates the legacy key (when present) or
+    /// falls back to defaults, writes the result under the new keys and removes the legacy key.
+    static func load(
+        from defaults: UserDefaults,
+        activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount
+    ) -> SuperThumbnailConcurrencySettings {
+        let hasAuto = defaults.object(forKey: autoEnabledKey) != nil
+        let hasRequested = defaults.object(forKey: requestedWorkerCountKey) != nil
+
+        if hasAuto || hasRequested {
+            let fallback = SuperThumbnailConcurrencySettings.defaultSettings(activeProcessorCount: activeProcessorCount)
+            let settings = SuperThumbnailConcurrencySettings(
+                isAutoEnabled: hasAuto ? defaults.bool(forKey: autoEnabledKey) : fallback.isAutoEnabled,
+                requestedWorkerCount: hasRequested
+                    ? defaults.integer(forKey: requestedWorkerCountKey)
+                    : fallback.requestedWorkerCount
+            )
+            if !hasAuto || !hasRequested {
+                save(settings, to: defaults)
+            }
+            if defaults.object(forKey: legacyPreferenceKey) != nil {
+                defaults.removeObject(forKey: legacyPreferenceKey)
+            }
+            return settings
+        }
+
+        let migrated = migrateLegacyPreference(
+            rawValue: defaults.string(forKey: legacyPreferenceKey),
+            activeProcessorCount: activeProcessorCount
         )
-        return min(itemLimit, maxFolderWorkers)
+        let settings = migrated ?? .defaultSettings(activeProcessorCount: activeProcessorCount)
+        save(settings, to: defaults)
+        defaults.removeObject(forKey: legacyPreferenceKey)
+        return settings
+    }
+
+    static func save(_ settings: SuperThumbnailConcurrencySettings, to defaults: UserDefaults) {
+        defaults.set(settings.isAutoEnabled, forKey: autoEnabledKey)
+        defaults.set(settings.requestedWorkerCount, forKey: requestedWorkerCountKey)
     }
 }
 
