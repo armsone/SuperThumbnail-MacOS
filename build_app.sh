@@ -5,9 +5,9 @@ package_root="${0:A:h}"
 build_root="${package_root}/.build-release"
 output_app="${1:-${package_root}/dist/NasFinder Super Thumbnail.app}"
 icon_source="${package_root}/Resources/AppIcon-1024.png"
-app_version="${APP_VERSION:-2.3.1}"
-build_number="${BUILD_NUMBER:-202608270910}"
-build_stamp="${DISPLAY_BUILD_NUMBER:-202608270910}"
+app_version="${APP_VERSION:-2.3.2}"
+build_number="${BUILD_NUMBER:-202608271106}"
+build_stamp="${DISPLAY_BUILD_NUMBER:-202608271106}"
 
 CLANG_MODULE_CACHE_PATH="${build_root}/module-cache" \
 SWIFTPM_MODULECACHE_OVERRIDE="${build_root}/module-cache" \

@@ -177,22 +177,35 @@ final class FolderSuperThumbnailTests: XCTestCase {
         XCTAssertFalse(claims.contains { $0.hasPrefix(".claim-") })
     }
 
-    func testSkinToneThresholdBoundaryMatchesDocumentedFraction() {
-        // 12x12 sample grid: 61/144 = 0.4236 >= 0.42, 60/144 = 0.4167 < 0.42.
-        XCTAssertTrue(SheetSkinTonePolicy.shouldBlur(skinToneCount: 61, sampleCount: 144))
-        XCTAssertFalse(SheetSkinTonePolicy.shouldBlur(skinToneCount: 60, sampleCount: 144))
+    func testFolderBlurRampsAfterTwentyPercentAndCapsAtTwoPointFivePoints() {
+        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPoints(skinToneFraction: 0), 0)
+        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPoints(skinToneFraction: 0.20), 0)
+        XCTAssertGreaterThan(
+            SheetSkinTonePolicy.blurRadiusPoints(skinToneCount: 29, sampleCount: 144),
+            0
+        )
+        XCTAssertEqual(
+            SheetSkinTonePolicy.blurRadiusPoints(skinToneFraction: 0.60),
+            1.25,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPoints(skinToneFraction: 1), 2.5)
+        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPoints(skinToneFraction: 1.5), 2.5)
+        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPoints(skinToneFraction: .nan), 0)
         XCTAssertTrue(SheetSkinTonePolicy.isSkinTone(red: 200, green: 120, blue: 90))
         XCTAssertFalse(SheetSkinTonePolicy.isSkinTone(red: 40, green: 140, blue: 240))
-        // 1.5 pt at the 384 px / 192 pt reference is 3 px; the radius scales
-        // with the sheet size so it is never re-derived per consumer.
-        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPoints, 1.5)
-        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPixels, 3.0)
-        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPixels(forSheetPixelSize: 384), 3.0)
-        XCTAssertEqual(SheetSkinTonePolicy.blurRadiusPixels(forSheetPixelSize: 192), 1.5)
+        XCTAssertEqual(
+            SheetSkinTonePolicy.blurRadiusPixels(skinToneFraction: 1, forSheetPixelSize: 384),
+            5
+        )
+        XCTAssertEqual(
+            SheetSkinTonePolicy.blurRadiusPixels(skinToneFraction: 1, forSheetPixelSize: 192),
+            2.5
+        )
     }
 
     /// A parent must compose from the child's unblurred tile, not from the
-    /// blurred sheet stored in the vault, so the final 1.5 pt blur is applied
+    /// blurred sheet stored in the vault, so the final graded blur is applied
     /// exactly once per sheet. Sharpness is measured as the number of
     /// transitional luminance pixels between the dark and skin-tone tiles: a
     /// blurred edge spreads over several pixels, a sharp edge over about one.
@@ -202,7 +215,7 @@ final class FolderSuperThumbnailTests: XCTestCase {
         let parent = root.appendingPathComponent("parent", isDirectory: true)
         let child = parent.appendingPathComponent("child", isDirectory: true)
         try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
-        // 5 skin-tone tiles (>= 42% of the sheet) and 4 near-black tiles give
+        // 5 skin-tone tiles (> 20% of the sheet) and 4 near-black tiles give
         // the child sheet a blur and strong edges between neighbouring tiles.
         var sources: [(String, (Double, Double, Double))] = []
         for index in 1...4 { sources.append(("dark-\(index).png", (0.02, 0.02, 0.02))) }
@@ -264,7 +277,7 @@ final class FolderSuperThumbnailTests: XCTestCase {
             )
             XCTAssertEqual(parentResult.state, .generated)
             XCTAssertEqual(parentResult.usedChildFolderSheetCount, 1)
-            // One skin-tone tile out of nine never reaches 42%.
+            // One skin-tone tile out of nine remains below 20%.
             XCTAssertFalse(parentResult.didBlur)
             let parentSheet = try XCTUnwrap(loadImage(at: parentSheetURL))
             XCTAssertEqual(parentSheet.width, 384)

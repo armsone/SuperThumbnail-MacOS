@@ -48,32 +48,39 @@ enum FolderContactSheetPlanner {
 }
 
 /// Local-only skin-tone pixel heuristic. Thresholds are byte-identical to the
-/// iOS SkinToneBlurPolicy: a completed sheet downsampled to 12x12 whose
-/// skin-tone pixel share reaches 0.42 is blurred as a whole. No image ever
-/// leaves this machine and no ML model is involved.
+/// A completed sheet is sampled on a deterministic 12x12 grid. Folder blur is
+/// zero through 20% skin-tone share, then rises linearly to a 2.5 point cap at
+/// 100%. No image ever leaves this machine and no ML model is involved.
 enum SheetSkinTonePolicy {
-    static let requiredFraction = 0.42
+    static let blurFreeFraction = 0.20
+    static let maximumBlurRadiusPoints = 2.5
     static let sampleSide = 12
-    /// The blur is applied exactly once, to the final sheet, at 1.5 logical
-    /// points. The 384 px sheet is displayed at roughly 192 pt on a 2x
-    /// screen, so 1.5 pt is 3 px of Gaussian radius at that reference.
-    /// Parents compose from unblurred child tiles, so a parent's final blur
-    /// never compounds with a child's blur.
-    static let blurRadiusPoints = 1.5
     static let referenceSheetPixelSize = 384
     static let referenceDisplayPointSize = 192
 
-    static var blurRadiusPixels: Double {
-        blurRadiusPixels(forSheetPixelSize: referenceSheetPixelSize)
+    static func skinToneFraction(skinToneCount: Int, sampleCount: Int) -> Double {
+        guard sampleCount > 0 else { return 0 }
+        return Double(skinToneCount) / Double(sampleCount)
     }
 
-    static func blurRadiusPixels(forSheetPixelSize side: Int) -> Double {
-        blurRadiusPoints * Double(side) / Double(referenceDisplayPointSize)
+    static func blurRadiusPoints(skinToneFraction: Double) -> Double {
+        guard skinToneFraction.isFinite else { return 0 }
+        let normalized = (skinToneFraction - blurFreeFraction) / (1 - blurFreeFraction)
+        return min(max(normalized, 0), 1) * maximumBlurRadiusPoints
     }
 
-    static func shouldBlur(skinToneCount: Int, sampleCount: Int) -> Bool {
-        guard sampleCount > 0 else { return false }
-        return Double(skinToneCount) / Double(sampleCount) >= requiredFraction
+    static func blurRadiusPoints(skinToneCount: Int, sampleCount: Int) -> Double {
+        blurRadiusPoints(
+            skinToneFraction: skinToneFraction(
+                skinToneCount: skinToneCount,
+                sampleCount: sampleCount
+            )
+        )
+    }
+
+    static func blurRadiusPixels(skinToneFraction: Double, forSheetPixelSize side: Int) -> Double {
+        blurRadiusPoints(skinToneFraction: skinToneFraction)
+            * Double(side) / Double(referenceDisplayPointSize)
     }
 
     static func isSkinTone(red: UInt8, green: UInt8, blue: UInt8) -> Bool {
@@ -91,7 +98,7 @@ enum SheetSkinTonePolicy {
             && abs(r - g) > 8
     }
 
-    static func isSkinToneDominant(_ image: CGImage) -> Bool {
+    static func skinToneFraction(_ image: CGImage) -> Double {
         let width = sampleSide
         let height = sampleSide
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
@@ -103,7 +110,7 @@ enum SheetSkinTonePolicy {
             bytesPerRow: width * 4,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return false }
+        ) else { return 0 }
         context.interpolationQuality = .low
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
 
@@ -117,7 +124,7 @@ enum SheetSkinTonePolicy {
                 skinToneCount += 1
             }
         }
-        return shouldBlur(skinToneCount: skinToneCount, sampleCount: width * height)
+        return skinToneFraction(skinToneCount: skinToneCount, sampleCount: width * height)
     }
 }
 
@@ -294,14 +301,16 @@ extension VaultProcessor {
                 )
             }
         }
-        // Exactly one blur, on the final sheet only.
+        // Exactly one graded blur, on the final sheet only.
         var sheet = unblurredSheet
-        let didBlur = SheetSkinTonePolicy.isSkinToneDominant(sheet)
+        let skinToneFraction = SheetSkinTonePolicy.skinToneFraction(sheet)
+        let blurRadius = SheetSkinTonePolicy.blurRadiusPixels(
+            skinToneFraction: skinToneFraction,
+            forSheetPixelSize: sheetPixelSize
+        )
+        let didBlur = blurRadius > 0
         if didBlur {
-            sheet = try blurred(
-                sheet,
-                radius: SheetSkinTonePolicy.blurRadiusPixels(forSheetPixelSize: sheetPixelSize)
-            )
+            sheet = try blurred(sheet, radius: blurRadius)
         }
         let data = try jpegData(from: sheet, quality: 0.82)
         try Task.checkCancellation()
