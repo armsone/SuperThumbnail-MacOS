@@ -16,20 +16,20 @@ Sparkle 업데이트 서명에는 EdDSA 키 쌍이 필요합니다.
 ```sh
 # 1. 유니버설 앱 빌드, Sparkle 프레임워크 임베드, Info.plist 업데이터 키 삽입, 서명
 SIGN_IDENTITY="Developer ID Application: ..." \
-APP_VERSION=2.3.1 \
-BUILD_NUMBER=202608270910 \
-DISPLAY_BUILD_NUMBER=202608270910 \
+APP_VERSION=2.3.2 \
+BUILD_NUMBER=202608291428 \
+DISPLAY_BUILD_NUMBER=202608291428 \
 ./build_app.sh
 
 # 2. drag-to-Applications DMG 생성 (+ 서명 + 공증)
 SIGN_IDENTITY="Developer ID Application: ..." \
 NOTARY_PROFILE="notary-profile-name" \
-APP_VERSION=2.3.1 \
+APP_VERSION=2.3.2 \
 ./make_dmg.sh
 
 # 3. 서명된 appcast 갱신
 SPARKLE_BIN_DIR=/path/to/Sparkle-2.9.4/bin \
-APP_VERSION=2.3.1 \
+APP_VERSION=2.3.2 \
 ./make_appcast.sh
 ```
 

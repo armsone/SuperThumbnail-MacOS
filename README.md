@@ -15,6 +15,7 @@ Finder에 마운트된 NAS 또는 Mac 폴더를 직접 읽어 NasFinder의 `.Nas
 - 자동 모드는 여유가 있을 때 지정한 수를 사용하고 발열이 심하면 절반, 위험 수준이면 1개로 축소한 뒤 식으면 다시 복귀
 - 작업자 수 설정과 발열 변화는 실행 중에도 반영: 이미 시작한 항목은 끝까지 처리하고 다음 항목부터 새 제한 적용(높이면 대기 항목 즉시 추가 시작)
 - 폴더 수퍼썸네일은 자식 폴더를 먼저 처리하며 같은 깊이에서 파일 작업자 수의 절반(최소 1개)만큼 병렬 처리
+- 폴더 수퍼썸네일의 피부색 비율에 따라 흐림 강도를 단계적으로 적용하고 중첩 흐림 방지
 - 동시 작업 충돌을 줄이는 worker/claim 기록
 
 ## 개발
@@ -27,6 +28,6 @@ swift build -c release
 
 최소 지원 버전은 macOS 14이며 AVFoundation과 ImageIO만 사용합니다.
 
-`build_app.sh`는 기본적으로 버전 `2.3.1`, 빌드 `202608270910`(표시 빌드 `202608270910`)의 `dist/NasFinder Super Thumbnail.app`을 arm64+x86_64 유니버설 바이너리로 만들고 ad-hoc 서명합니다. Developer ID 배포본은 `SIGN_IDENTITY`, `APP_VERSION`, `BUILD_NUMBER`, `DISPLAY_BUILD_NUMBER` 환경변수를 지정한 뒤 Apple 공증을 진행합니다.
+`build_app.sh`는 기본적으로 버전 `2.3.2`, 빌드 `202608291428`(표시 빌드 `202608291428`)의 `dist/NasFinder Super Thumbnail.app`을 arm64+x86_64 유니버설 바이너리로 만들고 ad-hoc 서명합니다. Developer ID 배포본은 `SIGN_IDENTITY`, `APP_VERSION`, `BUILD_NUMBER`, `DISPLAY_BUILD_NUMBER` 환경변수를 지정한 뒤 Apple 공증을 진행합니다.
 
 앱은 Sparkle 2.9.4로 시작 시 자동 업데이트 확인(6시간 주기)과 메뉴의 "업데이트 확인…" 수동 확인을 제공합니다. 릴리스/서명 절차는 `RELEASE.md`를 참고하세요.
