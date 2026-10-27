@@ -80,12 +80,9 @@ enum LocalVolumeDetector {
         return isValid && isSupported
     }
 
-    /// Bounded async inspection off MainActor.
-    /// Inspects the target URL to ensure it has verified atomic rename exclusion capability (fgetattrlist).
-    /// Does NOT perform global ancestor walks to / or Foundation normalization on remote paths.
-    /// Checks strictly at the approved root for NAS handoff markers (.NasFinder-Handoff)
-    /// and verifies volume capabilities. Unknown/remote/errors stay nonlocal.
-    /// NEVER falls back network volumes to local due to missing control folder.
+    /// Inspect only the selected volume off MainActor. Mounted SMB uses the common
+    /// per-file claim and the existing vault publication protocol; stale handoff
+    /// metadata never requires an active NAS job. Other volumes retain capability checks.
     static func inspectVolume(at url: URL) async -> LocalVolumeStatus {
         await Task.detached(priority: .userInitiated) {
             let path = url.path
@@ -93,18 +90,17 @@ enum LocalVolumeDetector {
                 return .volumeMetadataUnavailable("경로가 비어 있습니다.")
             }
 
-            // 1. Cooperative handoff marker check strictly at approved root (no ancestor walk)
-            let handoffPath = (path as NSString).appendingPathComponent(LocalConversionConstants.handoffDirName)
-            var handoffStat = stat()
-            if lstat(handoffPath, &handoffStat) == 0 {
-                return .requiresSharedCoordination("경로에 NAS 협업 마커(\(LocalConversionConstants.handoffDirName))가 존재합니다.")
-            }
-
             // 2. Kernel statfs metadata verification
             var fs = statfs()
             guard statfs(path, &fs) == 0 else {
                 let err = errno
                 return .volumeMetadataUnavailable("statfs 조회 실패 (errno \(err))")
+            }
+
+            // Mounted SMB uses the same per-file claim and atomic publication as the vault.
+            // An old handoff marker must not make Mac encoding depend on a running NAS job.
+            if isDirectClaimNetworkFilesystem(fs) {
+                return .localReady
             }
 
             // 3. Verify exclusive atomic rename capability (fgetattrlist ATTR_VOL_CAPABILITIES)
@@ -127,10 +123,20 @@ enum LocalVolumeDetector {
         }.value
     }
 
+    /// smbfs and webdav mounts use the common per-file claim directly, without NAS marker/job.
+    static func isDirectClaimNetworkFilesystem(_ fs: statfs) -> Bool {
+        let name = withUnsafeBytes(of: fs.f_fstypename) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return name == "smbfs" || name == "webdav"
+    }
+
     /// Available bytes on the volume containing the given URL.
     static func availableCapacityBytes(for url: URL) -> Int64? {
         var fs = statfs()
         guard statfs(url.path, &fs) == 0 else { return nil }
+        // smbfs/webdav that report no quota (total blocks 0) are unknown, not full.
+        if isDirectClaimNetworkFilesystem(fs), fs.f_blocks == 0 { return nil }
         return Int64(fs.f_bavail) * Int64(fs.f_bsize)
     }
 }
@@ -600,6 +606,11 @@ final class LocalFileLockManager: @unchecked Sendable {
 
     private init() {}
 
+    private static func isDirectClaimNetworkFD(_ fd: Int32) -> Bool {
+        var volume = statfs()
+        return fstatfs(fd, &volume) == 0 && LocalVolumeDetector.isDirectClaimNetworkFilesystem(volume)
+    }
+
     fileprivate func removeInProcessLock(_ identity: LocalFileIdentity) {
         lock.lock()
         inProcessLocks.remove(identity)
@@ -635,6 +646,16 @@ final class LocalFileLockManager: @unchecked Sendable {
 
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let err = errno
+            // WebDAV/SMB may reject advisory flock; only then the common per-file claim is the primary exclusion.
+            if (err == ENOTSUP || err == EOPNOTSUPP) && Self.isDirectClaimNetworkFD(fd) {
+                return LocalFileLock(
+                    fd: fd,
+                    parentFD: parentFD,
+                    fileName: fileName,
+                    identity: identity,
+                    relativeComponents: relativeComponents
+                )
+            }
             removeInProcessLock(identity)
             Darwin.close(fd)
             Darwin.close(parentFD)
@@ -750,6 +771,30 @@ struct LocalPublishedThumbnail: Sendable {
 enum LocalPublicationManager {
     private static let vaultDirName = LocalConversionConstants.vaultDirName
 
+    /// Publishers already hold the common per-output claim. SMB supports atomic rename,
+    /// but not Darwin's RENAME_EXCL; use the vault's existing check-then-rename protocol.
+    private static func renameClaimed(_ dirFD: Int32, _ source: String, _ destination: String) -> Int32 {
+        if renameatx_np(dirFD, source, dirFD, destination, 0x00000004) == 0 {
+            return 0
+        }
+        let exclusiveError = errno
+        guard exclusiveError == ENOTSUP || exclusiveError == EOPNOTSUPP else {
+            return -1
+        }
+        var volume = statfs()
+        guard fstatfs(dirFD, &volume) == 0, LocalVolumeDetector.isDirectClaimNetworkFilesystem(volume) else {
+            errno = exclusiveError
+            return -1
+        }
+        var existing = stat()
+        if fstatat(dirFD, destination, &existing, AT_SYMLINK_NOFOLLOW) == 0 {
+            errno = EEXIST
+            return -1
+        }
+        guard errno == ENOENT else { return -1 }
+        return renameat(dirFD, source, dirFD, destination)
+    }
+
     /// Flushes to stable storage: F_FULLFSYNC when supported, otherwise plain fsync. Failure means not durable.
     private static func fullSync(_ fd: Int32) -> Bool {
         if fcntl(fd, F_FULLFSYNC) == 0 { return true }
@@ -794,7 +839,8 @@ enum LocalPublicationManager {
         outputExpectedSize: Int64,
         outputExpectedSha256: String,
         attemptID: String,
-        claim: VideoConversionClaim? = nil
+        claim: VideoConversionClaim? = nil,
+        onCopyProgress: (@Sendable (Double) -> Void)? = nil
     ) throws -> LocalPublishedMP4 {
         let dirFD = sourceLock.parentFD
         let originalFileName = sourceLock.fileName
@@ -869,8 +915,9 @@ enum LocalPublicationManager {
 
             var hasher = SHA256()
             var totalBytes: Int64 = 0
+            var lastReportedCopyPercent = -1
             while true {
-                let chunk = engineHandle.readData(ofLength: 512 * 1024)
+                let chunk = try engineHandle.read(upToCount: 512 * 1024) ?? Data()
                 if chunk.isEmpty { break }
                 hasher.update(data: chunk)
                 totalBytes += Int64(chunk.count)
@@ -885,6 +932,15 @@ enum LocalPublicationManager {
                             throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "스테이징 파일 쓰기 실패 (errno \(err))"])
                         }
                         written += res
+                    }
+                }
+                if let onCopyProgress, outputExpectedSize > 0 {
+                    // flush/close/rename checks remain after the last byte, so never report 100% here.
+                    let fraction = min(0.99, Double(totalBytes) / Double(outputExpectedSize))
+                    let percent = Int(fraction * 100)
+                    if percent > lastReportedCopyPercent {
+                        lastReportedCopyPercent = percent
+                        onCopyProgress(fraction)
                     }
                 }
             }
@@ -959,7 +1015,7 @@ enum LocalPublicationManager {
         claim?.markSourceMutationStarted()
 
         // 7. Exclusive no-overwrite publication of STEM.mp4 (Darwin RENAME_EXCL = 0x00000004). Original is NOT touched.
-        if renameatx_np(dirFD, stagedFileName, dirFD, finalFileName, 0x00000004) != 0 {
+        if renameClaimed(dirFD, stagedFileName, finalFileName) != 0 {
             let renameErr = errno
 
             // Ambiguous I/O must retain all recovery evidence and claim. Cleanup/mutation flag reset is allowed
@@ -1134,7 +1190,7 @@ enum LocalPublicationManager {
                 unlinkat(vaultFD, tempName, 0)
                 throw writeFailure
             }
-            if renameatx_np(vaultFD, tempName, vaultFD, thumbnailName, 0x00000004) != 0 {
+            if renameClaimed(vaultFD, tempName, thumbnailName) != 0 {
                 let err = errno
                 unlinkat(vaultFD, tempName, 0)
                 // A concurrent client may have published the same key; it is validated below, never trusted.
@@ -1333,7 +1389,7 @@ enum LocalPublicationManager {
         }
         Darwin.close(fd)
 
-        if renameatx_np(dirFD, tempName, dirFD, fileName, 0x00000004 /* RENAME_EXCL */) != 0 {
+        if renameClaimed(dirFD, tempName, fileName) != 0 {
             let err = errno
             unlinkat(dirFD, tempName, 0)
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 배타적 발행 실패 (errno \(err))"])

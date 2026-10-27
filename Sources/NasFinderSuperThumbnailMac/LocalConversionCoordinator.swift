@@ -175,6 +175,8 @@ enum LocalConversionWorker {
         context: LocalAttemptContext,
         pinnedRoot: NASPinnedRoot,
         engineBridge: DefaultNASConversionEngineBridge,
+        downloadLimiter: NASResourceLimiter,
+        encodeLimiter: NASResourceLimiter,
         onProgress: @Sendable @escaping (Double?, String?) -> Void,
         onStageChange: @Sendable @escaping (LocalConversionStage, String) -> Void
     ) async -> LocalWorkerResult {
@@ -188,6 +190,12 @@ enum LocalConversionWorker {
         let requiredSpace = fileSize * 2 + 500_000_000
         if let available = LocalVolumeDetector.availableCapacityBytes(for: sourceURL), available < requiredSpace {
             let msg = "디스크 여유 공간 부족 (필요: \(requiredSpace / 1024 / 1024)MB, 사용 가능: \(available / 1024 / 1024)MB)"
+            return .failed(message: msg)
+        }
+        // Download/encode cache lives in the local temporary directory regardless of remote quota reporting.
+        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        if let localAvailable = LocalVolumeDetector.availableCapacityBytes(for: tempURL), localAvailable < requiredSpace {
+            let msg = "Mac 임시 공간 부족 (필요: \(requiredSpace / 1024 / 1024)MB, 사용 가능: \(localAvailable / 1024 / 1024)MB)"
             return .failed(message: msg)
         }
 
@@ -293,51 +301,68 @@ enum LocalConversionWorker {
             try Task.checkCancellation()
 
             // 5. Copy source media into private workspace from the SAME locked descriptor
-            onStageChange(.copyingSource, "원본 임시 복사 중")
-            claim.updatePhase("copyingSource")
-
             let sourceRelative = "sources/source.\(engineExt)"
             let sourceDestURL = workspaceURL.appendingPathComponent(sourceRelative)
             let sourcesDir = sourceDestURL.deletingLastPathComponent()
 
             try FileManager.default.createDirectory(at: sourcesDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
-            let dupSourceFD = dup(lock.fd)
-            guard dupSourceFD >= 0 else {
-                let err = errno
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "원본 디스크립터 복제 실패 (errno \(err))"])
+            let sourceFD = lock.fd
+            let expectedIdentity = lock.identity
+            let (sourceSha256, copiedBytes) = try await downloadLimiter.withPermit { () -> (String, Int64) in
+                onStageChange(.copyingSource, "원본 임시 복사 중")
+
+                let dupSourceFD = dup(sourceFD)
+                guard dupSourceFD >= 0 else {
+                    let err = errno
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "원본 디스크립터 복제 실패 (errno \(err))"])
+                }
+                let sourceHandle = FileHandle(fileDescriptor: dupSourceFD, closeOnDealloc: true)
+                _ = lseek(dupSourceFD, 0, SEEK_SET)
+
+                FileManager.default.createFile(atPath: sourceDestURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+                let destHandle = try FileHandle(forWritingTo: sourceDestURL)
+                defer { try? destHandle.close() }
+
+                var hasher = SHA256()
+                var copied: Int64 = 0
+                var lastReportedPercent = -1
+                onProgress(0, "다운로드 중")
+                while true {
+                    try Task.checkCancellation()
+                    let chunk = try sourceHandle.read(upToCount: 512 * 1024) ?? Data()
+                    if chunk.isEmpty { break }
+                    hasher.update(data: chunk)
+                    copied += Int64(chunk.count)
+                    destHandle.write(chunk)
+                    if fileSize > 0 {
+                        // Cap at 0.99 until the copy size and source identity are verified.
+                        let fraction = min(0.99, Double(copied) / Double(fileSize))
+                        let percent = Int(fraction * 100)
+                        if percent != lastReportedPercent {
+                            lastReportedPercent = percent
+                            onProgress(fraction, "다운로드 중")
+                        }
+                    }
+                }
+                try destHandle.synchronize()
+
+                try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: sourceDestURL.path)
+
+                let sha = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+                // Verify identity unchanged during copy
+                let postCopyIdentity = try LocalFileIdentity.inspect(fd: sourceFD)
+                guard postCopyIdentity == expectedIdentity, copied == fileSize else {
+                    throw NSError(domain: "LocalConversionError", code: 30, userInfo: [NSLocalizedDescriptionKey: "복사 전후 원본 파일 식별 정보 불일치"])
+                }
+
+                onProgress(1, "다운로드 완료 · 인코딩 대기")
+                return (sha, copied)
             }
-            let sourceHandle = FileHandle(fileDescriptor: dupSourceFD, closeOnDealloc: true)
-            _ = lseek(dupSourceFD, 0, SEEK_SET)
-
-            FileManager.default.createFile(atPath: sourceDestURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
-            let destHandle = try FileHandle(forWritingTo: sourceDestURL)
-            defer { try? destHandle.close() }
-
-            var hasher = SHA256()
-            var copiedBytes: Int64 = 0
-            while true {
-                try Task.checkCancellation()
-                let chunk = sourceHandle.readData(ofLength: 512 * 1024)
-                if chunk.isEmpty { break }
-                hasher.update(data: chunk)
-                copiedBytes += Int64(chunk.count)
-                destHandle.write(chunk)
-            }
-            try destHandle.synchronize()
-
-            try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: sourceDestURL.path)
-
-            let sourceSha256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-
-            // Verify identity unchanged during copy
-            let postCopyIdentity = try LocalFileIdentity.inspect(fd: lock.fd)
-            guard postCopyIdentity == lock.identity, copiedBytes == fileSize else {
-                throw NSError(domain: "LocalConversionError", code: 30, userInfo: [NSLocalizedDescriptionKey: "복사 전후 원본 파일 식별 정보 불일치"])
-            }
+            claim.updatePhase("copyingSource")
 
             // 6. Invoke ConversionEngine via engineBridge.encodeLocal
-            onStageChange(.converting, "번들 엔진 변환 중")
             claim.updatePhase("converting")
 
             let environment = NASToolEnvironment.detect()
@@ -346,22 +371,25 @@ enum LocalConversionWorker {
             }
 
             let outputRelative = "out/output.mp4"
-            let engineResult = try await engineBridge.encodeLocal(
-                environment: environment,
-                workspaceRoot: workspaceURL,
-                jobID: attemptID,
-                ref: engineRef,
-                sourceLocalRelativePath: sourceRelative,
-                sourceExt: ".\(engineExt)",
-                sourceExpectedSize: copiedBytes,
-                sourceExpectedSha256: sourceSha256,
-                outputRelativePath: outputRelative,
-                onProgress: { prog in
-                    let pct = prog.phase_pct
-                    let label = prog.phase_label ?? prog.phase
-                    onProgress(pct.map { $0 / 100.0 }, label)
-                }
-            )
+            let engineResult = try await encodeLimiter.withPermit { () -> NASEngineResultLine in
+                onStageChange(.converting, "번들 엔진 변환 중")
+                return try await engineBridge.encodeLocal(
+                    environment: environment,
+                    workspaceRoot: workspaceURL,
+                    jobID: attemptID,
+                    ref: engineRef,
+                    sourceLocalRelativePath: sourceRelative,
+                    sourceExt: ".\(engineExt)",
+                    sourceExpectedSize: copiedBytes,
+                    sourceExpectedSha256: sourceSha256,
+                    outputRelativePath: outputRelative,
+                    onProgress: { prog in
+                        let pct = prog.phase_pct
+                        let label = prog.phase_label ?? prog.phase
+                        onProgress(pct.map { $0 / 100.0 }, label)
+                    }
+                )
+            }
 
             guard engineResult.status == "ok", let outputSummary = engineResult.output else {
                 throw NSError(domain: "LocalConversionError", code: 32, userInfo: [NSLocalizedDescriptionKey: "엔진 인코딩 실패 (\(engineResult.code)): \(engineResult.message)"])
@@ -406,7 +434,10 @@ enum LocalConversionWorker {
                 outputExpectedSize: outputSummary.size,
                 outputExpectedSha256: outputSummary.sha256,
                 attemptID: attemptID,
-                claim: claim
+                claim: claim,
+                onCopyProgress: { fraction in
+                    onProgress(fraction, "완료본 저장 중")
+                }
             )
             outputPublished = true
 
@@ -479,6 +510,10 @@ final class LocalConversionCoordinator: ObservableObject {
                 maxConcurrentConversions = clamped
             }
             UserDefaults.standard.set(maxConcurrentConversions, forKey: LocalConversionConstants.concurrencyDefaultsKey)
+            let n = maxConcurrentConversions
+            Task { [encodeLimiter] in
+                await encodeLimiter.setCapacity(n)
+            }
             scheduleWork()
         }
     }
@@ -509,6 +544,8 @@ final class LocalConversionCoordinator: ObservableObject {
     var onDirectWorkCompleted: (() -> Void)?
 
     private let engineBridge: DefaultNASConversionEngineBridge
+    private let downloadLimiter = NASResourceLimiter(capacity: 1)
+    private let encodeLimiter: NASResourceLimiter
     private var folderCursors: [UUID: LocalIncrementalFolderCursor] = [:]
     private var folderGenerations: [UUID: Int] = [:]
     private var folderPins: [UUID: NASPinnedRoot] = [:]
@@ -529,11 +566,15 @@ final class LocalConversionCoordinator: ObservableObject {
 
         // Restore persisted concurrency setting (bounded 1...4, default 2)
         let storedConcurrency = UserDefaults.standard.integer(forKey: LocalConversionConstants.concurrencyDefaultsKey)
+        let initialConcurrency: Int
         if storedConcurrency >= 1 && storedConcurrency <= 4 {
+            initialConcurrency = storedConcurrency
             self.maxConcurrentConversions = storedConcurrency
         } else {
+            initialConcurrency = LocalConversionConstants.defaultConcurrency
             self.maxConcurrentConversions = LocalConversionConstants.defaultConcurrency
         }
+        self.encodeLimiter = NASResourceLimiter(capacity: initialConcurrency)
 
         loadRememberedFolders()
     }
@@ -805,8 +846,13 @@ final class LocalConversionCoordinator: ObservableObject {
             effectiveLimit = maxConcurrentConversions
         }
 
-        // Free slots count: effective limit minus active tasks and in-flight candidate discovery pulls
-        var freeSlots = effectiveLimit - (activeTasks.count + inFlightPulls)
+        Task { [encodeLimiter] in
+            await encodeLimiter.setCapacity(effectiveLimit)
+        }
+
+        // Overlapped pipeline: up to 3N active tasks across download (1), encode (N), and publication phases
+        let maxActiveJobs = effectiveLimit * 3
+        var freeSlots = maxActiveJobs - (activeTasks.count + inFlightPulls)
         guard freeSlots > 0 else {
             updateQueueSummary()
             return
@@ -926,11 +972,6 @@ final class LocalConversionCoordinator: ObservableObject {
             return
         }
 
-        // Candidate-local, bounded journal inspection
-        if let journalNotice = LocalCrashRecovery.inspectCandidateJournal(candidateURL: candidate.url) {
-            self.recoveryNotice = journalNotice
-        }
-
         let attemptID = UUID().uuidString.lowercased()
         let engineRef = "local-\(attemptID)"
 
@@ -966,6 +1007,8 @@ final class LocalConversionCoordinator: ObservableObject {
         activeEngineRefs[itemID] = engineRef
 
         let bridge = self.engineBridge
+        let downloadLimit = self.downloadLimiter
+        let encodeLimit = self.encodeLimiter
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             defer { pin.close() }
 
@@ -973,6 +1016,8 @@ final class LocalConversionCoordinator: ObservableObject {
                 context: context,
                 pinnedRoot: pin,
                 engineBridge: bridge,
+                downloadLimiter: downloadLimit,
+                encodeLimiter: encodeLimit,
                 onProgress: { [weak self] fraction, label in
                     Task { @MainActor [weak self] in
                         self?.updateItemProgress(itemID, fraction: fraction, label: label)
@@ -1054,8 +1099,10 @@ final class LocalConversionCoordinator: ObservableObject {
         let folderErrors = readyFolders.compactMap { folderCursors[$0.id]?.lastError }
         if !folderErrors.isEmpty {
             statusMessage = "변환 완료 (일부 폴더 오류 발생: \(folderErrors.first ?? "")) - 처리 \(counters.handledCount)개"
+        } else if counters.failedCount > 0 {
+            statusMessage = "변환 종료: 완료 \(counters.completedCount)개, 실패 \(counters.failedCount)개, 건너뜀 \(counters.skippedCount)개"
         } else if counters.handledCount > 0 {
-            statusMessage = "모든 변환 작업 완료 (총 \(counters.handledCount)개 처리)"
+            statusMessage = "모든 변환 작업 완료 (완료 \(counters.completedCount)개, 실패 0개, 건너뜀 \(counters.skippedCount)개)"
         } else {
             statusMessage = "변환 대상 파일을 찾지 못했습니다."
         }

@@ -361,7 +361,7 @@ struct VideoConversionView: View {
             .controlSize(.small)
 
             if coordinator.isRunning {
-                Text("실행 \(coordinator.counters.inProgressCount)개")
+                Text("처리 \(coordinator.counters.inProgressCount)개")
                     .font(.caption)
                     .foregroundStyle(secondaryColor)
                     .lineLimit(1)
@@ -561,7 +561,7 @@ struct VideoConversionView: View {
             HStack(spacing: 24) {
                 counterMetric("발견", coordinator.counters.discoveredCount, subtext: coordinator.isSearching ? "탐색 중" : "변환 대상", valueColor: primaryColor)
                 counterMetric("완료", coordinator.counters.completedCount, subtext: "MP4 완료", valueColor: accentColor)
-                counterMetric("진행 중", coordinator.counters.inProgressCount, subtext: "현재 인코딩", valueColor: primaryColor)
+                counterMetric("진행 중", coordinator.counters.inProgressCount, subtext: "준비·변환·저장", valueColor: primaryColor)
                 counterMetric("실패", coordinator.counters.failedCount, subtext: "오류 발생", valueColor: coordinator.counters.failedCount > 0 ? dangerColor : primaryColor)
                 counterMetric("건너뜀", coordinator.counters.skippedCount, subtext: "기존 완료/제외", valueColor: secondaryColor)
             }
@@ -667,8 +667,8 @@ struct VideoConversionView: View {
                     .foregroundStyle(accentColor)
             }
 
-            phaseProgress(item.stage == .converting ? (item.phaseLabel ?? "인코딩") : item.stage.displayName,
-                          fraction: item.stage == .converting ? item.fraction : nil,
+            phaseProgress(item.phaseLabel ?? item.stage.displayName,
+                          fraction: item.fraction,
                           active: item.stage.isRunning)
 
             HStack {
@@ -882,7 +882,7 @@ struct VideoConversionView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 12) {
-                Text("SuperThumbnail v2.7.2 • macOS 네이티브 영상 변환")
+                Text("SuperThumbnail v2.7.3 • macOS 네이티브 영상 변환")
                     .font(.caption2)
                     .foregroundStyle(secondaryColor)
 

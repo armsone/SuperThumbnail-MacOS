@@ -484,6 +484,30 @@ final class VideoConversionClaim: @unchecked Sendable {
 
     // MARK: - Publication Verification
 
+    /// WebDAV가 열거 결과에 끼워 넣는 캐시된 자기 항목(유령)인지 판별한다.
+    /// 유령은 openat/fstat는 성공하지만 fdopendir(childFD)가 NULL과 errno=ENOENT로 실패한다(readdir 이전).
+    /// 실제 하위 디렉터리는 fdopendir가 성공하므로 유령으로 인정하지 않는다.
+    /// 그 외 모든 실패(open/fstat/다른 errno)는 fail closed(false)이다.
+    private static func isWebDAVPhantomSelfEntry(parentFD: Int32, name: String) -> Bool {
+        let probeFD = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard probeFD >= 0 else { return false }
+        var probeStat = stat()
+        guard fstat(probeFD, &probeStat) == 0, (probeStat.st_mode & S_IFMT) == S_IFDIR else {
+            Darwin.close(probeFD)
+            return false
+        }
+        // fdopendir 성공 시 probeFD 소유권은 DIR 스트림으로 이전되며 closedir가 정확히 한 번 닫는다.
+        errno = 0
+        guard let probeStream = fdopendir(probeFD) else {
+            // close가 errno를 덮어쓰기 전에 먼저 캡처한다.
+            let captured = errno
+            Darwin.close(probeFD)
+            return captured == ENOENT
+        }
+        closedir(probeStream)
+        return false
+    }
+
     /// Verifies owned token/name, container identity, and the current claim directory entry identity
     /// before source preservation and output commit.
     /// A missing/replaced/unreadable claim stops publication.
@@ -530,23 +554,49 @@ final class VideoConversionClaim: @unchecked Sendable {
         }
 
         // 3. Bounded directory inspection only of tiny claim directory (no folder scan)
-        let dupFD = dup(claimFD)
-        guard dupFD >= 0 else {
-            throw VideoClaimError.claimVerificationFailed("클레임 디스크립터 복제 실패")
+        // WebDAV 디렉터리 열거는 "."이 아니라 디렉터리 자신의 basename(claimDirName)을 첫 자기 항목으로 반환한다.
+        // 검증된 containerFD 기준으로 클레임 디렉터리를 새로 열고 inode를 재확인한다.
+        // 자기 항목은 캐시된 유령 항목이라 d_ino가 클레임 inode와 다르므로 inode로 구별할 수 없다.
+        // webdav에서만, 자기 basename의 DT_DIR 항목 1개가 열거 시 ENOENT로 실패할 때(유령)에 한해 허용한다.
+        let enumFD = openat(containerFD, claimDirName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard enumFD >= 0 else {
+            throw VideoClaimError.claimVerificationFailed("클레임 열거용 디렉터리 열기 실패")
         }
-        guard let dirStream = fdopendir(dupFD) else {
-            Darwin.close(dupFD)
+        var enumStat = stat()
+        guard fstat(enumFD, &enumStat) == 0,
+              (enumStat.st_mode & S_IFMT) == S_IFDIR,
+              enumStat.st_dev == claimStatDev,
+              enumStat.st_ino == claimStatIno else {
+            Darwin.close(enumFD)
+            throw VideoClaimError.claimDirectoryMissingOrReplaced
+        }
+        var enumFS = statfs()
+        let isWebDAV = fstatfs(enumFD, &enumFS) == 0 && withUnsafeBytes(of: enumFS.f_fstypename) { raw -> Bool in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
+            return String(cString: base) == "webdav"
+        }
+        // fdopendir 성공 시 enumFD 소유권은 DIR 스트림으로 이전되며 closedir가 닫는다.
+        guard let dirStream = fdopendir(enumFD) else {
+            Darwin.close(enumFD)
             throw VideoClaimError.claimVerificationFailed("클레임 디렉터리 스트림 열기 실패")
         }
         defer { closedir(dirStream) }
-        // dup()된 FD는 claimFD와 파일 오프셋을 공유하므로, 이전 검증이 소비한 스트림이 EOF로 보이지 않게 처음부터 읽는다.
-        rewinddir(dirStream)
 
         var ownerFileNames: [String] = []
         var totalEntries = 0
+        var sawWebDAVSelfEntry = false
         let maxEntries = 32
 
-        while let entry = readdir(dirStream) {
+        while true {
+            // 프로브 등이 남긴 errno가 새지 않도록 매 readdir 전에 초기화한다.
+            errno = 0
+            guard let entry = readdir(dirStream) else {
+                let readErr = errno
+                if readErr != 0 {
+                    throw VideoClaimError.claimVerificationFailed("클레임 디렉터리 읽기 실패 (errno \(readErr))")
+                }
+                break
+            }
             totalEntries += 1
             if totalEntries > maxEntries {
                 throw VideoClaimError.claimVerificationFailed("클레임 디렉터리 항목 수 한도 초과")
@@ -558,6 +608,13 @@ final class VideoConversionClaim: @unchecked Sendable {
             }
 
             if entryName == "." || entryName == ".." {
+                continue
+            }
+
+            if isWebDAV, !sawWebDAVSelfEntry, entryName == claimDirName,
+               entry.pointee.d_type == UInt8(DT_DIR),
+               Self.isWebDAVPhantomSelfEntry(parentFD: dirfd(dirStream), name: entryName) {
+                sawWebDAVSelfEntry = true
                 continue
             }
 
