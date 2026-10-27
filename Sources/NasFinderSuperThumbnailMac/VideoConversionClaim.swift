@@ -508,6 +508,39 @@ final class VideoConversionClaim: @unchecked Sendable {
         return false
     }
 
+    /// 알려진 네트워크 파일시스템(webdav, smbfs)인지 판별한다. 실패 시 fail closed(false).
+    private static func isNetworkFilesystem(fd: Int32) -> Bool {
+        var fs = statfs()
+        guard fstatfs(fd, &fs) == 0 else { return false }
+        let name = withUnsafeBytes(of: fs.f_fstypename) { raw -> String in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return "" }
+            return String(cString: base)
+        }
+        return name == "webdav" || name == "smbfs"
+    }
+
+    /// macOS가 네트워크 파일시스템에 자동 생성하는 AppleDouble 사이드카 중 우리 토큰의 정확한 파일명만 해당한다.
+    private var ownAppleDoubleNames: [String] {
+        ["._owner-\(token).json", "._hb-\(token).json", "._hb-\(token).json.tmp"]
+    }
+
+    /// 사이드카가 nofollow 단일 링크 일반 파일이고 크기가 제한 이내이며 AppleDouble 매직(0x00051607)을 가졌는지 검증한다.
+    private static func isValidAppleDoubleFile(dirFD: Int32, name: String) -> Bool {
+        let fd = openat(dirFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFREG,
+              st.st_nlink == 1,
+              st.st_size >= 26,
+              st.st_size <= 65536 else { return false }
+        var header = [UInt8](repeating: 0, count: 4)
+        let res = header.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, 4) }
+        guard res == 4 else { return false }
+        return header == [0x00, 0x05, 0x16, 0x07]
+    }
+
     /// Verifies owned token/name, container identity, and the current claim directory entry identity
     /// before source preservation and output commit.
     /// A missing/replaced/unreadable claim stops publication.
@@ -575,6 +608,7 @@ final class VideoConversionClaim: @unchecked Sendable {
             guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
             return String(cString: base) == "webdav"
         }
+        let isNetworkFS = Self.isNetworkFilesystem(fd: enumFD)
         // fdopendir 성공 시 enumFD 소유권은 DIR 스트림으로 이전되며 closedir가 닫는다.
         guard let dirStream = fdopendir(enumFD) else {
             Darwin.close(enumFD)
@@ -615,6 +649,15 @@ final class VideoConversionClaim: @unchecked Sendable {
                entry.pointee.d_type == UInt8(DT_DIR),
                Self.isWebDAVPhantomSelfEntry(parentFD: dirfd(dirStream), name: entryName) {
                 sawWebDAVSelfEntry = true
+                continue
+            }
+
+            // 네트워크 파일시스템이 우리 토큰 파일에 자동 생성한 정당한 AppleDouble 메타데이터만 소유자로 세지 않고 무시한다.
+            // 이름이 다르거나 검증에 실패한 "._" 항목은 아래에서 그대로 거부된다.
+            if isNetworkFS, ownAppleDoubleNames.contains(entryName) {
+                guard Self.isValidAppleDoubleFile(dirFD: dirfd(dirStream), name: entryName) else {
+                    throw VideoClaimError.claimVerificationFailed("AppleDouble 사이드카 검증 실패: \(entryName)")
+                }
                 continue
             }
 
@@ -771,6 +814,15 @@ final class VideoConversionClaim: @unchecked Sendable {
             stateLock.unlock()
             closeDescriptors()
             return notice
+        }
+
+        // 네트워크 파일시스템에서 자동 생성된 우리 토큰의 검증된 AppleDouble 사이드카만 제거한다.
+        // 검증 실패 항목은 건드리지 않으며, 이후 rmdir가 비어있지 않아 실패하면 증적으로 보존된다.
+        if Self.isNetworkFilesystem(fd: claimFD) {
+            for adName in ownAppleDoubleNames
+            where Self.isValidAppleDoubleFile(dirFD: claimFD, name: adName) {
+                _ = unlinkat(claimFD, adName, 0)
+            }
         }
 
         let ownerRes = unlinkat(claimFD, "owner-\(token).json", 0)
