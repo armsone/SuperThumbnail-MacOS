@@ -1,5 +1,7 @@
 .build/
 .build-*/
+.task-logs-v240/
+.task-logs-v270/
 dist/
 .DS_Store
 .swiftpm/xcode/package.xcworkspace/xcuserdata/

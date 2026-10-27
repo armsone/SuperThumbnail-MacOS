@@ -5,15 +5,21 @@ import SwiftUI
 @main
 struct NasFinderSuperThumbnailMacApp: App {
     @StateObject private var model = SuperThumbnailMacModel.shared
+    @StateObject private var helperCoordinator = NASHelperCoordinator()
+    @StateObject private var localCoordinator = LocalConversionCoordinator()
     @StateObject private var updateController = UpdateController()
 
     var body: some Scene {
         WindowGroup {
-            SuperThumbnailMacView(model: model)
-                .frame(minWidth: 760, minHeight: 610)
+            SuperThumbnailAppContainerView(
+                model: model,
+                helperCoordinator: helperCoordinator,
+                localCoordinator: localCoordinator
+            )
+            .frame(minWidth: 760, minHeight: 650)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 900, height: 680)
+        .defaultSize(width: 900, height: 720)
         .commands {
             CommandGroup(after: .appInfo) {
                 Toggle("업데이트 자동 다운로드", isOn: Binding(
@@ -45,6 +51,82 @@ struct NasFinderSuperThumbnailMacApp: App {
                 .disabled(!model.canDecrementRequestedWorkerCount)
                 Button(model.concurrencyMenuStatusText) {}
                     .disabled(true)
+            }
+        }
+    }
+}
+
+/// Operational modes for the application.
+enum SuperThumbnailAppMode: String, CaseIterable, Identifiable {
+    case thumbnail = "수퍼썸네일 만들기"
+    case nasHelper = "NAS 영상 변환 돕기"
+
+    var id: String { rawValue }
+
+    var visibleTitle: String {
+        switch self {
+        case .thumbnail:
+            return "수퍼썸네일 만들기"
+        case .nasHelper:
+            return "영상 변환"
+        }
+    }
+}
+
+/// Root container wrapping existing Super Thumbnail generator and the native video conversion mode.
+struct SuperThumbnailAppContainerView: View {
+    @ObservedObject var model: SuperThumbnailMacModel
+    @ObservedObject var helperCoordinator: NASHelperCoordinator
+    @ObservedObject var localCoordinator: LocalConversionCoordinator
+    @AppStorage("macSuperThumbnail.selectedMode") private var selectedMode: SuperThumbnailAppMode = .thumbnail
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                Picker("모드", selection: $selectedMode) {
+                    ForEach(SuperThumbnailAppMode.allCases) { mode in
+                        Text(mode.visibleTitle).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 320)
+
+                Spacer()
+
+                if selectedMode == .nasHelper {
+                    if localCoordinator.isRunning {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 7, height: 7)
+                            Text("영상 처리 중 (\(localCoordinator.counters.inProgressCount)개)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if helperCoordinator.runState.isRunning {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 7, height: 7)
+                            Text(helperCoordinator.activeAttemptDetails.isEmpty ? "영상 준비 중" : "영상 처리 중")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 12)
+            .padding(.bottom, 10)
+            .background(Color(nsColor: .windowBackgroundColor))
+
+            Divider()
+
+            switch selectedMode {
+            case .thumbnail:
+                SuperThumbnailMacView(model: model)
+            case .nasHelper:
+                VideoConversionView(coordinator: localCoordinator, helperCoordinator: helperCoordinator)
             }
         }
     }

@@ -300,7 +300,9 @@ enum VaultProcessor {
     /// primary frame that is at least 50% black triggers one retry at exactly
     /// `duration * 6/13`; the retry is used only when it is below 50% black,
     /// otherwise (black retry or failed retry) the primary frame is kept.
-    private static func videoThumbnailData(for url: URL) async throws -> Data {
+    /// Reused by both the local vault processor and the NAS conversion helper
+    /// to generate JPEG thumbnail content for converted videos.
+    static func videoThumbnailData(for url: URL) async throws -> Data {
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -362,6 +364,27 @@ enum VaultProcessor {
             throw VaultProcessorError.cannotEncode
         }
         return output as Data
+    }
+
+    /// Upper bound for a Super Thumbnail JPEG accepted as a valid artifact.
+    static let maxThumbnailBytes = 10 * 1024 * 1024
+
+    /// True only for a complete, nonempty, decodable JPEG: SOI/EOI markers present,
+    /// ImageIO identifies it as JPEG and decodes the first image with nonzero size.
+    /// Used to reject zero-byte, truncated or otherwise corrupt cached artifacts.
+    static func isValidJPEGThumbnail(_ data: Data) -> Bool {
+        guard data.count >= 4, data.count <= maxThumbnailBytes else { return false }
+        let bytes = [UInt8](data)
+        guard bytes[0] == 0xFF, bytes[1] == 0xD8, bytes[2] == 0xFF,
+              bytes[bytes.count - 2] == 0xFF, bytes[bytes.count - 1] == 0xD9 else { return false }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source),
+              (type as String) == UTType.jpeg.identifier,
+              CGImageSourceGetCount(source) >= 1,
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              CGImageSourceGetStatus(source) == .statusComplete,
+              image.width > 0, image.height > 0 else { return false }
+        return true
     }
 
     /// Canonical `.NasFinder-Vault` directories strictly contained within the
