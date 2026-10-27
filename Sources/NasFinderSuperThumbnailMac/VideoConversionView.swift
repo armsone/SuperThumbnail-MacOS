@@ -667,7 +667,7 @@ struct VideoConversionView: View {
                     .foregroundStyle(accentColor)
             }
 
-            phaseProgress(item.stage == .converting ? "인코딩" : item.stage.displayName,
+            phaseProgress(item.stage == .converting ? (item.phaseLabel ?? "인코딩") : item.stage.displayName,
                           fraction: item.stage == .converting ? item.fraction : nil,
                           active: item.stage.isRunning)
 
@@ -700,7 +700,7 @@ struct VideoConversionView: View {
             HStack {
                 Text(title).font(.subheadline)
                 Spacer()
-                Text(fraction?.isFinite == true ? percentageText(fraction) : (active ? "진행 중" : "대기"))
+                Text(fraction?.isFinite == true ? percentageText(fraction) : (active ? "진행률 확인 중" : "대기"))
                     .font(.subheadline.monospacedDigit().bold())
                     .foregroundStyle(accentColor)
             }
@@ -709,14 +709,10 @@ struct VideoConversionView: View {
                     .progressViewStyle(.linear)
                     .tint(accentColor)
                     .scaleEffect(y: 1.6)
-            } else if active {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                    .tint(accentColor)
             } else {
                 ProgressView(value: 0)
                     .progressViewStyle(.linear)
-                    .accessibilityValue("대기")
+                    .accessibilityValue(active ? "진행률 확인 중" : "대기")
             }
         }
         .foregroundStyle(primaryColor)
@@ -762,13 +758,13 @@ struct VideoConversionView: View {
                     case .downloading:
                         phaseProgress("다운로드", fraction: item.downloadFraction, active: true)
                     case .converting:
-                        phaseProgress("인코딩", fraction: item.encodingFraction, active: true)
+                        phaseProgress(item.phaseLabel ?? "인코딩", fraction: item.encodingFraction, active: true)
                     case .uploading:
                         phaseProgress("업로드", fraction: item.uploadFraction, active: true)
                     case .generatingThumbnail:
                         phaseProgress("수퍼썸네일", fraction: nil, active: true)
                     case .waitingVerification:
-                        phaseProgress("저장 및 원본 정리 확인", fraction: nil, active: true)
+                        phaseProgress("영상 확인 및 저장", fraction: item.verificationFraction, active: true)
                     case .completed:
                         phaseProgress("완료", fraction: 1, active: false)
                     case .idle, .failed:
@@ -796,7 +792,7 @@ struct VideoConversionView: View {
                 Text("작업이 중단되었습니다. 폴더 연결을 확인한 뒤 다시 시작해 주세요.")
                     .font(.callout)
                     .foregroundStyle(dangerColor)
-            } else if helperCoordinator.runState == .stopped && !helperCoordinator.userStopped && helperCoordinator.connectionStatusText == "도움 정지됨" {
+            } else if helperCoordinator.runState == .stopped && !helperCoordinator.userStopped && helperCoordinator.connectionStatusText == "도움 정지됨" && counts.jobState != "completed" {
                 Text("폴더에 연결하지 못했습니다. 연결 상태를 확인한 뒤 다시 시작해 주세요.")
                     .font(.callout)
                     .foregroundStyle(dangerColor)
@@ -886,7 +882,7 @@ struct VideoConversionView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 12) {
-                Text("SuperThumbnail v2.7.1 • macOS 네이티브 영상 변환")
+                Text("SuperThumbnail v2.7.2 • macOS 네이티브 영상 변환")
                     .font(.caption2)
                     .foregroundStyle(secondaryColor)
 

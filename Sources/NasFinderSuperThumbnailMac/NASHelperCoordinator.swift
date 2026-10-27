@@ -1694,8 +1694,54 @@ final class NASHelperCoordinator: ObservableObject {
                 state: status.state,
                 counts: status.counts
             )
+            applyVerificationProgress(from: status, for: root)
         } else {
             rootStatuses.removeValue(forKey: root.rootID)
+        }
+    }
+
+    /// Consumes authoritative verification progress from validated NAS job status active items.
+    /// Strictly verifies connection, root, generation, epoch, job, client, item, and attempt identities.
+    /// Consumes server stage_percent only for active attempts currently in waitingVerification stage.
+    /// Values are mapped to a display fraction within 0.0 ... 0.99 (never 1.0 before committed receipt).
+    /// Nil indicates preparation and is never replaced with fabricated progress or elapsed time.
+    /// Never mutates client heartbeat state or progressTracker.
+    private func applyVerificationProgress(from status: NASWireJobStatus, for root: NASAcceptedRoot) {
+        for item in status.active_items {
+            guard let handle = activeAttempts[item.attempt_id] else { continue }
+            guard handle.connection == connectionSerial,
+                  handle.offer.root_id == root.rootID,
+                  handle.offer.root_generation == root.rootGeneration,
+                  handle.offer.coordinator_epoch == root.coordinatorEpoch,
+                  handle.offer.job_id == root.activeJobID,
+                  handle.offer.assigned_client_id == self.clientID,
+                  item.item_id == handle.itemID,
+                  item.attempt_id == handle.attemptID,
+                  item.assigned_client_id == self.clientID else {
+                continue
+            }
+
+            guard let detail = activeAttemptDetails.first(where: { $0.id == handle.attemptID }),
+                  detail.stage == .waitingVerification else {
+                continue
+            }
+
+            // 서버가 실제 검증 단계(waitingValidation)에 진입한 경우에만 진행률 수치 반영
+            guard item.stage == .waitingValidation else { continue }
+
+            let fraction: Double?
+            if let serverPct = item.stage_percent, serverPct.isFinite, (0.0...100.0).contains(serverPct) {
+                fraction = min(0.99, max(0.0, serverPct / 100.0))
+            } else {
+                fraction = nil
+            }
+
+            updateAttemptDisplay(handle.attemptID) {
+                guard $0.stage == .waitingVerification else { return }
+                $0.fraction = fraction
+                $0.verificationFraction = fraction
+                $0.phaseLabel = "영상 확인 및 저장 마무리 중"
+            }
         }
     }
 
@@ -2198,6 +2244,13 @@ final class NASHelperCoordinator: ObservableObject {
         localProgress.processedCount += 1
         consecutiveFailures[handle.offer.root_id] = 0
         itemFailureCounts.removeValue(forKey: handle.itemID)
+        updateAttemptDisplay(handle.attemptID) {
+            $0.stage = .completed
+            $0.fraction = 1.0
+            $0.uploadFraction = 1.0
+            $0.verificationFraction = 1.0
+            $0.phaseLabel = "완료"
+        }
         if thumbnailFailed {
             statusMessage = "영상 변환 및 저장 완료 (썸네일 등록 실패 - NAS 확인 필요)"
         } else {
@@ -2468,7 +2521,9 @@ final class NASHelperCoordinator: ObservableObject {
                             phaseLabel: "원본 다운로드 중"
                         )
                         Task { @MainActor in
-                            self?.updateAttemptDisplay(attemptID) {
+                            guard let self, self.activeAttempts[attemptID] === handle else { return }
+                            self.updateAttemptDisplay(attemptID) {
+                                guard $0.stage == .downloading else { return }
                                 $0.downloadFraction = ratio
                                 $0.fraction = ratio
                             }
@@ -2480,7 +2535,9 @@ final class NASHelperCoordinator: ObservableObject {
             // Only successful operation completion may set that phase 1.
             // Reset current fraction at stage transition; never carry download 100 into encoding.
             await MainActor.run {
+                guard self.activeAttempts[attemptID] === handle else { return }
                 self.updateAttemptDisplay(attemptID) {
+                    guard $0.stage == .downloading else { return }
                     $0.downloadFraction = 1.0
                     $0.fraction = nil
                     $0.phaseLabel = "변환 대기 중"
@@ -2534,8 +2591,9 @@ final class NASHelperCoordinator: ObservableObject {
                         phaseLabel: prog.phase_label ?? prog.phase
                     )
                     Task { @MainActor in
-                        guard let self else { return }
+                        guard let self, self.activeAttempts[attemptID] === handle else { return }
                         self.updateAttemptDisplay(attemptID) {
+                            guard $0.stage == .converting else { return }
                             $0.encodingFraction = frac
                             $0.fraction = frac
                             $0.phaseLabel = prog.phase_label ?? prog.phase
@@ -2547,7 +2605,9 @@ final class NASHelperCoordinator: ObservableObject {
             // Only successful operation completion may set that phase 1.
             // Reset current fraction at stage transition; never carry encoding 100 into upload.
             await MainActor.run {
+                guard self.activeAttempts[attemptID] === handle else { return }
                 self.updateAttemptDisplay(attemptID) {
+                    guard $0.stage == .converting else { return }
                     $0.encodingFraction = 1.0
                     $0.fraction = nil
                     $0.phaseLabel = "업로드 대기 중"
@@ -2629,7 +2689,7 @@ final class NASHelperCoordinator: ObservableObject {
                             guard total > 0 else { return nil }
                             let r = Double(done) / Double(total)
                             guard r.isFinite else { return nil }
-                            return min(1.0, max(0.0, r))
+                            return min(0.99, max(0.0, r))
                         }()
                         progress.update(
                             stage: .uploading,
@@ -2639,7 +2699,9 @@ final class NASHelperCoordinator: ObservableObject {
                             phaseLabel: "완료본 업로드 중"
                         )
                         Task { @MainActor in
-                            self?.updateAttemptDisplay(attemptID) {
+                            guard let self, self.activeAttempts[attemptID] === handle else { return }
+                            self.updateAttemptDisplay(attemptID) {
+                                guard $0.stage == .uploading else { return }
                                 $0.uploadFraction = ratio
                                 $0.fraction = ratio
                             }
@@ -2649,9 +2711,11 @@ final class NASHelperCoordinator: ObservableObject {
             }
 
             await MainActor.run {
+                guard self.activeAttempts[attemptID] === handle else { return }
                 self.updateAttemptDisplay(attemptID) {
-                    $0.uploadFraction = 1.0
-                    $0.fraction = nil
+                    guard $0.stage == .uploading else { return }
+                    $0.uploadFraction = 0.99
+                    $0.fraction = 0.99
                 }
             }
 
@@ -2678,10 +2742,12 @@ final class NASHelperCoordinator: ObservableObject {
             // Step 8: Poll for Server Receipt while lease remains positively valid
             progress.update(stage: .waitingValidation, phaseLabel: "NAS 확인 및 저장 대기")
             await MainActor.run {
+                guard self.activeAttempts[attemptID] === handle else { return }
                 self.updateAttemptDisplay(attemptID) {
                     $0.stage = .waitingVerification
                     $0.fraction = nil
-                    $0.phaseLabel = "NAS 확인 및 ‘_원본’ 보존 저장 대기 중"
+                    $0.verificationFraction = nil
+                    $0.phaseLabel = "영상 확인 및 저장 마무리 중"
                 }
             }
 

@@ -1108,7 +1108,7 @@ struct NASHelperView: View {
 
             Spacer()
 
-            Text("SuperThumbnail v2.7.1 • macOS 네이티브 협업 엔진")
+            Text("SuperThumbnail v2.7.2 • macOS 네이티브 협업 엔진")
                 .font(.caption2)
                 .foregroundStyle(palette.muted)
         }

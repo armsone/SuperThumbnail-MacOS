@@ -319,6 +319,7 @@ struct NASHelperAttemptDetail: Identifiable, Equatable, Sendable {
     var downloadFraction: Double? = nil
     var encodingFraction: Double? = nil
     var uploadFraction: Double? = nil
+    var verificationFraction: Double? = nil
 
     init(
         id: String,
@@ -328,7 +329,8 @@ struct NASHelperAttemptDetail: Identifiable, Equatable, Sendable {
         phaseLabel: String? = nil,
         downloadFraction: Double? = nil,
         encodingFraction: Double? = nil,
-        uploadFraction: Double? = nil
+        uploadFraction: Double? = nil,
+        verificationFraction: Double? = nil
     ) {
         self.id = id
         self.fileName = fileName
@@ -338,6 +340,7 @@ struct NASHelperAttemptDetail: Identifiable, Equatable, Sendable {
         self.downloadFraction = downloadFraction
         self.encodingFraction = encodingFraction
         self.uploadFraction = uploadFraction
+        self.verificationFraction = verificationFraction
     }
 }
 

@@ -7,7 +7,7 @@ legacy_build_root="${package_root}/.build-release"
 output_app="${1:-${package_root}/dist/NasFinder Super Thumbnail.app}"
 icon_source="${package_root}/Resources/AppIcon-1024.png"
 current_stamp="$(date +%Y%m%d%H%M)"
-app_version="${APP_VERSION:-2.7.1}"
+app_version="${APP_VERSION:-2.7.2}"
 build_number="${BUILD_NUMBER:-${current_stamp}}"
 build_stamp="${DISPLAY_BUILD_NUMBER:-${current_stamp}}"
 

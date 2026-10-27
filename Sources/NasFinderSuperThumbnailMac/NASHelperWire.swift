@@ -19,7 +19,7 @@ enum NASHelperWire {
     }
     static let versionDirectoryName = "v1"
     /// Client release shown to the NAS in join_batch / result.json (informational only; identity is the client UUID).
-    static let clientVersion = "2.7.1"
+    static let clientVersion = "2.7.2"
     /// `slots_offered` / `available_slots` range of the frozen schema (1...4 since NAS backend 0.4.1).
     static let maxSlotsPerRoot = 4
     /// Expanded slot limit negotiated with backends advertising `pipeline_slots_12` (backend 0.5.0-r2+).
