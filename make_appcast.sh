@@ -145,7 +145,7 @@ import CryptoKit
 import Foundation
 
 let args = CommandLine.arguments
-guard args.count == 4,
+guard args.count == 7,
       let key = Data(base64Encoded: args[1]), key.count == 32,
       let signature = Data(base64Encoded: args[3]), signature.count == 64,
       let file = FileManager.default.contents(atPath: args[2]),
@@ -154,9 +154,20 @@ else {
     FileHandle.standardError.write(Data("서명 검증 입력 형식 오류\n".utf8))
     exit(2)
 }
-exit(publicKey.isValidSignature(signature, for: file) ? 0 : 1)
+guard publicKey.isValidSignature(signature, for: file) else { exit(1) }
+// A replacement build uses the same download URL. Its old signature/length must not remain in the feed.
+let feedURL = URL(fileURLWithPath: args[4])
+let feed = try XMLDocument(contentsOf: feedURL)
+for node in try feed.nodes(forXPath: "/rss/channel/item") {
+    guard let item = node as? XMLElement,
+          item.elements(forName: "enclosure").first?.attribute(forName: "url")?.stringValue == args[5]
+    else { continue }
+    let version = try item.nodes(forXPath: "*[local-name()='version']").first?.stringValue
+    if version != args[6] { item.detach() }
+}
+try feed.xmlData(options: .nodePrettyPrint).write(to: feedURL, options: .atomic)
 SWIFT
-if ! /usr/bin/swift "${verifier}" "${expected_public_key}" "${dmg_path}" "${item_signature}"; then
+if ! /usr/bin/swift "${verifier}" "${expected_public_key}" "${dmg_path}" "${item_signature}" "${work_dir}/appcast.xml" "${item_url}" "${bundled_build}"; then
   print -u2 "appcast 서명이 앱의 SUPublicEDKey로 검증되지 않습니다. Keychain의 개인키가 이 공개키와 짝이 맞는지 확인하세요."
   exit 1
 fi
