@@ -1837,6 +1837,22 @@ def probe_decoded_frame_timeline(
             err_f.close()
 
 
+WHOLE_CADENCE_MIN_GAPS = 100  # fewer intervals are no cadence evidence
+WHOLE_CADENCE_MIN_SHARE = 0.99  # share of intervals that must sit within +/-35% of the median
+
+
+def whole_stream_cadence(times: List[float]) -> Optional[float]:
+    """The ONE measured frame cadence of a whole decoded video stream (median interval), or None. Needs strictly increasing
+    times, enough intervals and nearly every interval (WHOLE_CADENCE_MIN_SHARE) within +/-35% of the median."""
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    if len(gaps) < WHOLE_CADENCE_MIN_GAPS or any(g <= 0 or not math.isfinite(g) for g in gaps):
+        return None
+    med = statistics.median(gaps)
+    if med <= 0 or sum(1 for g in gaps if abs(g - med) <= 0.35 * med) < WHOLE_CADENCE_MIN_SHARE * len(gaps):
+        return None
+    return med
+
+
 def verify_decoded_presentation_match(
     source_path: str,
     out_path: str,
@@ -1937,7 +1953,9 @@ def verify_decoded_presentation_match(
             return f"비디오 스트림 #{idx} 결과 마지막 프레임 표시 기간 정보가 유효하지 않습니다"
 
         frame_period = float(Fraction(1, 1) / s_fps)
-        if parse_rational(sv.get("avg_frame_rate")) is None and parse_rational(sv.get("r_frame_rate")) == 1 / s_tb:
+        nominal_tick_stream = parse_rational(sv.get("avg_frame_rate")) is None and parse_rational(sv.get("r_frame_rate")) == 1 / s_tb
+        recent_cadence_stable = False
+        if nominal_tick_stream:
             # No average rate and r_frame_rate is just the inverse timebase (ASF/WMV 1000/1 on 1/1000): the nominal clock and the
             # last frame's duration are one tick, so the end uncertainty is the stream's measured cadence. Only with identical
             # frame counts (checked above) and a stable measured cadence; otherwise the strict nominal tolerance stays.
@@ -1946,10 +1964,21 @@ def verify_decoded_presentation_match(
                 med = statistics.median(gaps)
                 if all(abs(g - med) <= med * 0.35 for g in gaps):
                     frame_period = max(frame_period, med)
+                    recent_cadence_stable = True
         # Tail tolerance: PTS tolerance + at most 1 frame duration container muxing quantization + timebase precision
         max_tail_tol = max_pts_tol + frame_period + s_precision + o_precision
 
         s_end = s_v[-1] + s_last_dur
+        source_tail_is_one_tick = abs(s_last_dur - s_precision) <= s_precision * 0.01 + 1e-9
+        if nominal_tick_stream and not recent_cadence_stable and source_tail_is_one_tick:
+            # The observed source last-frame duration equals exactly one source timebase tick (so it carries no real duration; a genuine
+            # declared longer last frame never takes this path). The last frame has no real duration (one tick). Only when the WHOLE stream shows ONE measured cadence (nearly every
+            # interval within +/-35% of the median; the few genuine long gaps are already matched frame-for-frame above with the
+            # same frame count) and the output's own last-frame length is that cadence, the source's undefined end is the last
+            # time + the measured cadence. The tolerance is NOT widened: the output end must still match within max_tail_tol.
+            cadence = whole_stream_cadence(s_v)
+            if cadence is not None and abs(o_last_dur - cadence) <= 0.35 * cadence:
+                s_end = s_v[-1] + cadence
         o_end = o_v[-1] + o_last_dur
         tail_diff = abs(o_end - s_end)
         if tail_diff > max_tail_tol:

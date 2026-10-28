@@ -129,6 +129,18 @@ final class LocalRecoveryScopeTests: XCTestCase {
         XCTAssertEqual(LocalConversionCoordinator.retryTargets(from: locations).count, 1)
     }
 
+    func testPriorityRetryTargetsIncludeCancelledNewestFirstCappedAndExcludeCompleted() {
+        let caut = folder(caution)
+        func it(_ n: String, _ stage: LocalConversionStage, _ t: TimeInterval) -> LocalConversionItem {
+            item(path: "\(caution)/01-CLIP/\(n)", components: ["01-CLIP", n], stage: stage, at: t)
+        }
+        let items = [it("a.avi", .failed("x"), 1), it("b.avi", .cancelled, 2), it("c.avi", .completed, 3), it("d.avi", .skipped("s"), 4)]
+        let locations = LocalConversionCoordinator.latestHistoryLocations(from: items, folders: [caut])
+        let targets = LocalConversionCoordinator.priorityRetryTargets(from: locations)
+        XCTAssertEqual(targets.map { $0.components.last }, ["d.avi", "b.avi", "a.avi"])
+        XCTAssertEqual(LocalConversionCoordinator.priorityRetryTargets(from: locations, limit: 2).count, 2)
+    }
+
     func testRecoveryDirectoriesAreUniqueParentsPlusRootsAndExcludeCompleted() {
         let caut = folder(caution)
         func it(_ rel: [String], _ stage: LocalConversionStage, _ t: TimeInterval) -> LocalConversionItem {
@@ -226,6 +238,113 @@ final class LocalRecoveryScopeTests: XCTestCase {
         XCTAssertEqual(result.candidates.first?.relativeComponents, ["01-CLIP", "FAST", "clip.avi"])
         XCTAssertNotNil(result.candidates.first?.publishedResume)
         XCTAssertEqual(try snapshot(), before)
+    }
+
+    /// A remaining priority retry whose MP4 is already published (pending thumbnail) must still reach the real published-resume check.
+    func testPriorityRetryTargetWithPublishedMP4ReachesPublishedResumeAndRegularCandidateIsNotDuplicated() throws {
+        try mkdir("D")
+        let dir = root.appendingPathComponent("D", isDirectory: true)
+        let dirFD = open(dir.path, O_RDONLY | O_DIRECTORY)
+        XCTAssertGreaterThanOrEqual(dirFD, 0)
+        defer { close(dirFD) }
+        let mp4 = Data("published-mp4-bytes".utf8)
+        try Data("original-avi".utf8).write(to: dir.appendingPathComponent("clip.avi"))
+        try mp4.write(to: dir.appendingPathComponent("clip.mp4"))
+        try Data("fresh".utf8).write(to: dir.appendingPathComponent("fresh.avi"))
+        var st = stat()
+        XCTAssertEqual(stat(dir.appendingPathComponent("clip.avi").path, &st), 0)
+        let attempt = "f6851a2f-e2a9-4ebf-ae26-9edefafb7916"
+        let journal = LocalJournalRecord(
+            attemptID: attempt, originalFileName: "clip.avi", backupFileName: "clip_원본.avi", finalFileName: "clip.mp4",
+            stagedFileName: ".clip.stage-\(attempt).mp4", sourceDevice: Int64(st.st_dev), sourceInode: UInt64(st.st_ino),
+            sourceSize: Int64(st.st_size), sourceMtime: Int64(st.st_mtimespec.tv_sec), outputSize: Int64(mp4.count),
+            outputSha256: SHA256.hash(data: mp4).map { String(format: "%02x", $0) }.joined(), state: .outputPublished,
+            createdAt: Date(timeIntervalSinceReferenceDate: 814860439.216238), thumbnailFileName: nil
+        )
+        try LocalPublicationManager.writeJournalRecord(journal, fileName: ".clip.journal-\(attempt)-published.json", dirFD: dirFD)
+        let before = try snapshot()
+
+        let selected = LocalFolderItem(url: root)
+        let pin = try openPin(selected)
+        defer { pin.close() }
+        let pins = [selected.id: pin]
+        func target(_ n: String) -> LocalRetryTarget { LocalRetryTarget(folderID: selected.id, components: ["D", n]) }
+
+        // the regular inspection alone skips the existing MP4 (the defect)
+        XCTAssertTrue(LocalConversionRetryInspector.inspect(targets: [target("clip.avi")], folders: [selected], pins: pins).candidates.isEmpty)
+
+        // the feed item for the same path (queued as .retry, so not repeated as .publishedResume) now yields the resume candidate
+        let items = LocalConversionCoordinator.priorityFeedItems(remainingPriority: [target("clip.avi")], resumeTargets: [target("clip.avi")])
+        XCTAssertEqual(items.count, 1)
+        let result = LocalConversionCoordinator.inspectFeedItem(items[0], folders: [selected], pins: pins)
+        XCTAssertEqual(result.candidates.count, 1, "\(result.notes) \(result.errors)")
+        XCTAssertEqual(result.candidates.first?.relativeComponents, ["D", "clip.avi"])
+        XCTAssertNotNil(result.candidates.first?.publishedResume)
+
+        // a normal fresh retry target yields exactly one regular candidate (no resume duplicate)
+        let fresh = LocalConversionCoordinator.inspectFeedItem(
+            LocalConversionCoordinator.PriorityFeedItem(target: target("fresh.avi"), kind: .retry), folders: [selected], pins: pins
+        )
+        XCTAssertEqual(fresh.candidates.map { $0.relativeComponents.last }, ["fresh.avi"])
+        XCTAssertNil(fresh.candidates.first?.publishedResume)
+        XCTAssertEqual(try snapshot(), before)
+    }
+
+    func testPriorityInspectionStopsAtFirstSafeCandidateAndLeavesTheRestForIncrementalFeed() throws {
+        try mkdir("D")
+        for name in ["a.avi", "b.avi", "c.avi"] { try Data("x".utf8).write(to: root.appendingPathComponent("D/\(name)")) }
+        let selected = LocalFolderItem(url: root)
+        func target(_ n: String) -> LocalRetryTarget { LocalRetryTarget(folderID: selected.id, components: ["D", n]) }
+        let pin = try openPin(selected)
+        defer { pin.close() }
+        // gone.avi no longer exists (nothing to encode), a.avi is the first safe candidate, b.avi/c.avi must NOT be inspected yet
+        let targets = [target("gone.avi"), target("a.avi"), target("b.avi"), target("c.avi")]
+        let first = LocalConversionCoordinator.inspectUntilFirstCandidate(targets: targets, folders: [selected], pins: [selected.id: pin])
+        XCTAssertEqual(first.inspection.candidates.map { $0.relativeComponents.last }, ["a.avi"])
+        XCTAssertEqual(first.remaining, [target("b.avi"), target("c.avi")])
+        // the remainder is not dropped: inspected one by one it yields exactly the rest, in order
+        let rest = first.remaining.flatMap {
+            LocalConversionRetryInspector.inspect(targets: [$0], folders: [selected], pins: [selected.id: pin]).candidates
+        }
+        XCTAssertEqual(rest.map { $0.relativeComponents.last }, ["b.avi", "c.avi"])
+        // no safe candidate at all: everything inspected, nothing remains
+        let none = LocalConversionCoordinator.inspectUntilFirstCandidate(targets: [target("gone.avi")], folders: [selected], pins: [selected.id: pin])
+        XCTAssertTrue(none.inspection.candidates.isEmpty)
+        XCTAssertTrue(none.remaining.isEmpty)
+    }
+
+    func testRunCannotFinishWhileTheFeederStillHasInspectionsEvenAtEarlyEOFWithNothingActive() {
+        typealias C = LocalConversionCoordinator
+        XCTAssertFalse(C.runHasNothingLeft(activeCount: 0, inFlightPulls: 0, pendingCount: 0, feederPending: true))
+        XCTAssertTrue(C.runHasNothingLeft(activeCount: 0, inFlightPulls: 0, pendingCount: 0, feederPending: false))
+        XCTAssertFalse(C.runHasNothingLeft(activeCount: 1, inFlightPulls: 0, pendingCount: 0, feederPending: false))
+        XCTAssertFalse(C.runHasNothingLeft(activeCount: 0, inFlightPulls: 1, pendingCount: 0, feederPending: false))
+        XCTAssertFalse(C.runHasNothingLeft(activeCount: 0, inFlightPulls: 0, pendingCount: 2, feederPending: false))
+    }
+
+    func testFeedAdmissionSkipsFailedActiveAndAlreadyQueuedIdentitiesAndPaths() throws {
+        try mkdir("D")
+        for name in ["a.avi", "b.avi", "c.avi", "d.avi"] { try Data("x".utf8).write(to: root.appendingPathComponent("D/\(name)")) }
+        let selected = LocalFolderItem(url: root)
+        let pin = try openPin(selected)
+        defer { pin.close() }
+        func candidate(_ n: String) -> LocalDiscoveredFile {
+            LocalConversionRetryInspector.inspect(targets: [LocalRetryTarget(folderID: selected.id, components: ["D", n])], folders: [selected], pins: [selected.id: pin]).candidates[0]
+        }
+        let a = candidate("a.avi"), b = candidate("b.avi"), c = candidate("c.avi"), d = candidate("d.avi")
+        // a failed earlier in this pass (e.g. by the folder scan), b is encoding, c is already queued; d is new (offered twice)
+        let admitted = LocalConversionCoordinator.admitFeedCandidates(
+            [a, b, c, d, d], active: [b.identity], failed: [a.identity], pending: [c]
+        )
+        XCTAssertEqual(admitted.map { $0.relativeComponents.last }, ["d.avi"])
+    }
+
+    func testFeedOrderPutsPriorityFirstThenResumesWithoutInspectingAFileTwice() {
+        let id = UUID()
+        func t(_ n: String) -> LocalRetryTarget { LocalRetryTarget(folderID: id, components: ["D", n]) }
+        let items = LocalConversionCoordinator.priorityFeedItems(remainingPriority: [t("b"), t("c")], resumeTargets: [t("a"), t("b"), t("c"), t("d")])
+        XCTAssertEqual(items.map { $0.target.components.last! }, ["b", "c", "a", "d"])
+        XCTAssertEqual(items.map { $0.kind == .retry }, [true, true, false, false])
     }
 
     func testSymlinkedDirectoryInRemappedTargetIsRejectedByPinnedWalk() throws {

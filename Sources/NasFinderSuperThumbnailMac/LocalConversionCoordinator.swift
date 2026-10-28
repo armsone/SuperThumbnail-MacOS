@@ -859,14 +859,14 @@ final class LocalConversionCoordinator: ObservableObject {
     var isExternalWorkActive: (() -> Bool)?
 
     var hasActiveWork: Bool {
-        isRunning || isPaused || isSearching || !activeItems.isEmpty || !activeTasks.isEmpty || inFlightPulls > 0 || !pendingCandidates.isEmpty || isRecovering
+        isRunning || isPaused || isSearching || !activeItems.isEmpty || !activeTasks.isEmpty || inFlightPulls > 0 || !pendingCandidates.isEmpty || isRecovering || priorityFeed != nil
     }
 
     /// A final denominator is available only after every selected direct folder was fully read.
     var knownTotalCount: Int? {
         if isTargetedRetry { return targetedTotal }
         let ready = folders.filter { $0.status.isReady }
-        guard !ready.isEmpty, inFlightPulls == 0, pendingCandidates.isEmpty,
+        guard !ready.isEmpty, inFlightPulls == 0, pendingCandidates.isEmpty, priorityFeed == nil,
               ready.allSatisfy({ folder in
                   guard let cursor = folderCursors[folder.id] else { return false }
                   return cursor.isExhausted && cursor.lastError == nil
@@ -892,6 +892,9 @@ final class LocalConversionCoordinator: ObservableObject {
     private var pendingCandidates: [LocalDiscoveredFile] = []
     private var currentRunGeneration: Int = 0
     private var failedIdentitiesInPass: Set<LocalFileIdentity> = []
+    /// Remaining incremental inspections (priority retries, then known published-MP4 resumes) of the unified start. It counts as
+    /// pending work: the run cannot finish while it exists.
+    private var priorityFeed: PriorityFeed?
     /// Finite retry of an explicit candidate list: never pulls from folder cursors.
     private var isTargetedRetry = false
     private var targetedTotal = 0
@@ -1149,6 +1152,11 @@ final class LocalConversionCoordinator: ObservableObject {
         onDirectWorkCompleted = nil
         currentRunGeneration += 1
         pendingCandidates.removeAll()
+        if let feed = priorityFeed {
+            // An inspection still in flight closes the pins itself when it returns (it sees the feed is gone).
+            if !feed.inFlight { feed.closePins() }
+            priorityFeed = nil
+        }
         isTargetedRetry = false
         targetedTotal = 0
         inFlightPulls = 0
@@ -1254,6 +1262,19 @@ final class LocalConversionCoordinator: ObservableObject {
         locations.filter { $0.stage.isFailed || $0.stage.isSkipped }.map(\.target)
     }
 
+    /// Max known not-completed files freshly inspected up front by the unified start (the full scan still covers the rest).
+    nonisolated static let priorityRetrySeedLimit = 24
+
+    /// Latest failed/skipped/CANCELLED files (newest first, capped) retried before the full-folder discovery. Cancelled covers
+    /// work stopped by an app update. Each one is still freshly inspected and goes through the normal claim/worker safeguards.
+    nonisolated static func priorityRetryTargets(from locations: [HistoryLocation], limit: Int = priorityRetrySeedLimit) -> [LocalRetryTarget] {
+        let pending = locations.filter {
+            if case .completed = $0.stage { return false }
+            return $0.stage.isFailed || $0.stage.isSkipped || $0.stage == .cancelled
+        }
+        return pending.reversed().prefix(max(0, limit)).map(\.target)
+    }
+
     /// Unique parent directories of every known not-completed file (failed/skipped/cancelled) plus each selected root.
     /// Used by the unified start to recover this Mac's own claims WITHOUT walking the whole tree first.
     nonisolated static func recoveryDirectories(from locations: [HistoryLocation], folders: [LocalFolderItem]) -> [UUID: Set<[String]>] {
@@ -1324,6 +1345,9 @@ final class LocalConversionCoordinator: ObservableObject {
         let locations = Self.latestHistoryLocations(from: historySnapshot, folders: readyFolders)
         let targets = includeAllRemaining ? [] : Self.retryTargets(from: locations)
         let hasRetryHistory = !targets.isEmpty
+        // Unified start: a small capped batch of known failed/cancelled/skipped files is freshly inspected and queued first; the
+        // full scan then continues (it never retries a file again in the same pass: queued/active/failed identities are excluded).
+        let priorityTargets = includeAllRemaining ? Self.priorityRetryTargets(from: locations) : []
         // Latest failed/skipped files that may already own a published MP4 (checked candidate-locally, read-only and without reading
         // the MP4 content; the worker proves the full SHA-256 before any thumbnail write). The regular scan is unchanged.
         let resumeTargets = Self.retryTargets(from: locations)
@@ -1341,37 +1365,187 @@ final class LocalConversionCoordinator: ObservableObject {
             let recovery = await LocalConversionRecovery.performRecovery(folders: readyFolders, pins: finalPins, onlyDirectories: recoveryScope)
 
             var inspection = LocalRetryInspection()
+            var feedItems: [PriorityFeedItem] = []
             if hasRetryHistory, recovery.blockedReason == nil {
                 inspection = await Task.detached(priority: .userInitiated) {
                     LocalConversionRetryInspector.inspect(targets: targets, folders: readyFolders, pins: finalPins)
                 }.value
-            }
-            if !resumeTargets.isEmpty, recovery.blockedReason == nil {
-                let known = await Task.detached(priority: .userInitiated) {
-                    LocalConversionRecovery.inspectKnownPublishedResume(targets: resumeTargets, folders: readyFolders, pins: finalPins)
+                if !resumeTargets.isEmpty {
+                    // Finite targeted retry: its list is needed up front (the total is shown), so this read stays here.
+                    let known = await Task.detached(priority: .userInitiated) {
+                        LocalConversionRecovery.inspectKnownPublishedResume(targets: resumeTargets, folders: readyFolders, pins: finalPins)
+                    }.value
+                    inspection.candidates += known.candidates
+                    inspection.errors += known.errors
+                    inspection.notes += known.notes
+                }
+            } else if includeAllRemaining, recovery.blockedReason == nil {
+                // Unified start: only up to the FIRST safe priority candidate is inspected before the run starts. The rest of the
+                // priority targets and every known published-MP4 resume are fed one at a time while the run is already encoding.
+                let first = await Task.detached(priority: .userInitiated) {
+                    Self.inspectUntilFirstCandidate(targets: priorityTargets, folders: readyFolders, pins: finalPins)
                 }.value
-                inspection.candidates += known.candidates
-                inspection.errors += known.errors
-                inspection.notes += known.notes
+                inspection = first.inspection
+                feedItems = Self.priorityFeedItems(remainingPriority: first.remaining, resumeTargets: resumeTargets)
             }
-            for pin in finalPins.values { pin.close() }
-
-            guard let self else { return }
-            self.finishRecovery(recovery: recovery, inspection: inspection, hasRetryHistory: hasRetryHistory, unifiedStart: includeAllRemaining)
+            guard let self else {
+                for pin in finalPins.values { pin.close() }
+                return
+            }
+            let feed = feedItems.isEmpty ? nil : PriorityFeed(queue: feedItems, folders: readyFolders, pins: finalPins, generation: 0)
+            self.finishRecovery(recovery: recovery, inspection: inspection, hasRetryHistory: hasRetryHistory, unifiedStart: includeAllRemaining, feed: feed)
+            // Pins stay open only while a feed owns them; otherwise they are released right here.
+            if feed == nil { for pin in finalPins.values { pin.close() } }
         }
+    }
+
+    /// Feed order: remaining priority retries first, then the known published-MP4 resumes (a file already queued as a priority
+    /// retry is not inspected a second time).
+    nonisolated static func priorityFeedItems(remainingPriority: [LocalRetryTarget], resumeTargets: [LocalRetryTarget]) -> [PriorityFeedItem] {
+        let queuedKeys = Set(remainingPriority.map { "\($0.folderID.uuidString)/\($0.components.joined(separator: "/"))" })
+        return remainingPriority.map { PriorityFeedItem(target: $0, kind: .retry) }
+            + resumeTargets.filter { !queuedKeys.contains("\($0.folderID.uuidString)/\($0.components.joined(separator: "/"))") }
+                .map { PriorityFeedItem(target: $0, kind: .publishedResume) }
+    }
+
+    struct PriorityFeedItem: Sendable, Equatable {
+        enum Kind: Sendable { case retry, publishedResume }
+        let target: LocalRetryTarget
+        let kind: Kind
+    }
+
+    struct PriorityFeed {
+        var queue: [PriorityFeedItem]
+        let folders: [LocalFolderItem]
+        let pins: [UUID: NASPinnedRoot]
+        var generation: Int
+        var inFlight = false
+        func closePins() { for pin in pins.values { pin.close() } }
+    }
+
+    /// The run is over only if nothing is active, pulling, queued or still to be inspected by the feeder.
+    nonisolated static func runHasNothingLeft(activeCount: Int, inFlightPulls: Int, pendingCount: Int, feederPending: Bool) -> Bool {
+        activeCount == 0 && inFlightPulls == 0 && pendingCount == 0 && !feederPending
+    }
+
+    /// Candidates the feeder may add: not active, not already failed in this pass, not already queued (same identity or path),
+    /// and not repeated inside the batch itself. The folder scan applies the same identity rules.
+    nonisolated static func admitFeedCandidates(
+        _ candidates: [LocalDiscoveredFile], active: Set<LocalFileIdentity>, failed: Set<LocalFileIdentity>, pending: [LocalDiscoveredFile]
+    ) -> [LocalDiscoveredFile] {
+        func key(_ c: LocalDiscoveredFile) -> String { "\(c.folderID.uuidString)/\(c.relativeComponents.joined(separator: "/"))" }
+        var seenKeys = Set(pending.map(key))
+        var seenIdentities = Set(pending.map(\.identity))
+        var admitted: [LocalDiscoveredFile] = []
+        for candidate in candidates
+        where !active.contains(candidate.identity) && !failed.contains(candidate.identity)
+            && !seenIdentities.contains(candidate.identity) && !seenKeys.contains(key(candidate)) {
+            seenKeys.insert(key(candidate))
+            seenIdentities.insert(candidate.identity)
+            admitted.append(candidate)
+        }
+        return admitted
+    }
+
+    nonisolated static func inspectFeedItem(_ item: PriorityFeedItem, folders: [LocalFolderItem], pins: [UUID: NASPinnedRoot]) -> LocalRetryInspection {
+        switch item.kind {
+        case .retry:
+            // A priority path is never dropped from the resume list, so it needs BOTH checks: the regular fresh inspection
+            // (skips an existing MP4) and, only when that yields no candidate, the published-resume check (exact journal/hash/
+            // source protection stays in inspectKnownPublishedResume). A regular candidate is never duplicated by a resume.
+            var regular = LocalConversionRetryInspector.inspect(targets: [item.target], folders: folders, pins: pins)
+            if !regular.candidates.isEmpty { return regular }
+            let known = LocalConversionRecovery.inspectKnownPublishedResume(targets: [item.target], folders: folders, pins: pins)
+            regular.candidates += known.candidates
+            regular.errors += known.errors
+            regular.notes += known.notes
+            return regular
+        case .publishedResume:
+            return LocalConversionRecovery.inspectKnownPublishedResume(targets: [item.target], folders: folders, pins: pins)
+        }
+    }
+
+    /// One inspection at a time, and only while the pending queue is below the prefetch bound (same bound as the paused prefetch).
+    private func pumpPriorityFeed() {
+        guard var feed = priorityFeed else { return }
+        guard feed.generation == currentRunGeneration, isRunning else {
+            // Stale (stop() normally removed it already): release it unless an inspection still holds the pins.
+            if !feed.inFlight { feed.closePins() }
+            priorityFeed = nil
+            return
+        }
+        guard !isPaused, !feed.inFlight else { return }
+        if feed.queue.isEmpty {
+            feed.closePins()
+            priorityFeed = nil
+            return
+        }
+        guard pendingCandidates.count < 4 else { return }
+        let item = feed.queue.removeFirst()
+        feed.inFlight = true
+        priorityFeed = feed
+        let folders = feed.folders, pins = feed.pins, generation = feed.generation
+        Task { [weak self] in
+            let one = await Task.detached(priority: .utility) {
+                Self.inspectFeedItem(item, folders: folders, pins: pins)
+            }.value
+            guard let self else {
+                for pin in pins.values { pin.close() }
+                return
+            }
+            self.priorityFeedInspected(one, generation: generation, pins: pins)
+        }
+    }
+
+    private func priorityFeedInspected(_ one: LocalRetryInspection, generation: Int, pins: [UUID: NASPinnedRoot]) {
+        guard var feed = priorityFeed, feed.generation == generation, currentRunGeneration == generation, isRunning else {
+            // The run was stopped/replaced while this inspection was in flight: its result is dropped and the pins released here.
+            if priorityFeed?.generation == generation { priorityFeed = nil }
+            for pin in pins.values { pin.close() }
+            return
+        }
+        feed.inFlight = false
+        priorityFeed = feed
+        recoveryDetails += one.errors.map { "[폴더 오류] \($0)" } + one.notes.map { "[건너뜀] \($0)" }
+        let admitted = Self.admitFeedCandidates(
+            one.candidates, active: Set(activeItems.map(\.identity)), failed: failedIdentitiesInPass, pending: pendingCandidates
+        )
+        pendingCandidates.append(contentsOf: admitted)
+        scheduleWork()
+    }
+
+    /// Blocking (call off the MainActor): inspects targets in order, one at a time, and stops at the first safe candidate.
+    /// Returns what is left uninspected so the caller can feed it incrementally.
+    nonisolated static func inspectUntilFirstCandidate(
+        targets: [LocalRetryTarget], folders: [LocalFolderItem], pins: [UUID: NASPinnedRoot]
+    ) -> (inspection: LocalRetryInspection, remaining: [LocalRetryTarget]) {
+        var merged = LocalRetryInspection()
+        for (index, target) in targets.enumerated() {
+            let one = LocalConversionRetryInspector.inspect(targets: [target], folders: folders, pins: pins)
+            merged.errors += one.errors
+            merged.notes += one.notes
+            if !one.candidates.isEmpty {
+                merged.candidates = one.candidates
+                return (merged, Array(targets.dropFirst(index + 1)))
+            }
+        }
+        return (merged, [])
     }
 
     private func finishRecovery(
         recovery: LocalConversionRecoveryResult,
         inspection: LocalRetryInspection,
         hasRetryHistory: Bool,
-        unifiedStart: Bool = false
+        unifiedStart: Bool = false,
+        feed: PriorityFeed? = nil
     ) {
         recoveryDetails = recovery.detailLines + inspection.errors.map { "[폴더 오류] \($0)" } + inspection.notes.map { "[건너뜀] \($0)" }
         let summary = recovery.summaryMessage
         let errorSuffix = inspection.errors.isEmpty ? "" : " · 다시 시도 대상 확인 오류 \(inspection.errors.count)건"
 
         guard recovery.blockedReason == nil else {
+            // (a feed exists only when nothing blocked; kept released here for safety)
+            if let feed { feed.closePins() }
             isRecovering = false
             recoveryNotice = summary
             statusMessage = summary
@@ -1391,10 +1565,11 @@ final class LocalConversionCoordinator: ObservableObject {
                 : "\(summary) · 실패 기록이 없어 남은 원본 전체를 다시 찾아 변환합니다.\(resumeNote)"
             recoveryNotice = message
             isRecovering = false
-            beginFullRescan(message: "남은 원본 영상 전체 탐색 및 변환 시작", seed: resumeCandidates)
+            beginFullRescan(message: "남은 원본 영상 전체 탐색 및 변환 시작", seed: resumeCandidates, feed: feed)
             return
         }
 
+        feed?.closePins()
         var seen = Set<String>()
         var candidates: [LocalDiscoveredFile] = []
         for candidate in recovery.recoveredCandidates + inspection.candidates {
@@ -1426,14 +1601,17 @@ final class LocalConversionCoordinator: ObservableObject {
         beginFullRescan(message: "남은 원본 영상 전체 탐색 및 변환 시작")
     }
 
-    private func beginFullRescan(message: String, seed: [LocalDiscoveredFile] = []) {
-        guard !isRunning, !isRecovering else { return }
+    private func beginFullRescan(message: String, seed: [LocalDiscoveredFile] = [], feed: PriorityFeed? = nil) {
         let readyFolders = folders.filter { $0.status.isReady }
-        guard !readyFolders.isEmpty else { return }
-        guard preflightConversionTools() else { return }
+        guard !isRunning, !isRecovering, !readyFolders.isEmpty, preflightConversionTools() else {
+            feed?.closePins()
+            return
+        }
 
         currentRunGeneration += 1
         pendingCandidates = seed
+        priorityFeed = feed
+        priorityFeed?.generation = currentRunGeneration
         failedIdentitiesInPass.removeAll()
         isTargetedRetry = false
         targetedTotal = 0
@@ -1487,6 +1665,8 @@ final class LocalConversionCoordinator: ObservableObject {
         Task { [encodeLimiter] in
             await encodeLimiter.setCapacity(effectiveLimit)
         }
+
+        pumpPriorityFeed()
 
         // Overlapped pipeline: up to 3N active tasks across download (1), encode (N), and publication phases
         let maxActiveJobs = effectiveLimit * 3
@@ -1546,7 +1726,7 @@ final class LocalConversionCoordinator: ObservableObject {
         isSearching = true
         statusMessage = "한 개씩 찾는 중..."
 
-        let activeIDs = Set(activeItems.map(\.identity))
+        let activeIDs = Set(activeItems.map(\.identity)).union(pendingCandidates.map(\.identity))
         let failedIDs = failedIdentitiesInPass
         let runGen = currentRunGeneration
 
@@ -1748,7 +1928,8 @@ final class LocalConversionCoordinator: ObservableObject {
     }
 
     private func checkOverallCompletion() {
-        guard activeTasks.isEmpty && inFlightPulls == 0 && pendingCandidates.isEmpty else {
+        pumpPriorityFeed() // releases an exhausted feed so it cannot hold the run open
+        guard Self.runHasNothingLeft(activeCount: activeTasks.count, inFlightPulls: inFlightPulls, pendingCount: pendingCandidates.count, feederPending: priorityFeed != nil) else {
             return
         }
 
