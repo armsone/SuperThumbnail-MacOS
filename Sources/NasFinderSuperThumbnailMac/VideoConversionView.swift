@@ -992,7 +992,7 @@ struct VideoConversionView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 12) {
-                Text("SuperThumbnail v2.7.15 • macOS 네이티브 영상 변환")
+                Text("SuperThumbnail v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown") • macOS 네이티브 영상 변환")
                     .font(.caption2)
                     .foregroundStyle(secondaryColor)
 
