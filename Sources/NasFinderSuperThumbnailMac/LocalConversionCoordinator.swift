@@ -1795,7 +1795,9 @@ final class LocalConversionCoordinator: ObservableObject {
             return
         }
 
-        for _ in 0..<freeSlots {
+        // The folder cursor is serial: one outstanding pull at most, so slow scans never reserve slots that pending priority
+        // candidates or the 3N pipeline bound could use. A pull that becomes a worker reschedules to start the next one.
+        if inFlightPulls == 0 {
             pullNextCandidateAndConvert()
         }
     }
@@ -1866,6 +1868,7 @@ final class LocalConversionCoordinator: ObservableObject {
                 if let candidate {
                     self.counters.discoveredCount += 1
                     self.startConversion(for: candidate)
+                    self.scheduleWork()
                 } else {
                     if let err = cursor.lastError {
                         self.statusMessage = "폴더 오류: \(err)"
