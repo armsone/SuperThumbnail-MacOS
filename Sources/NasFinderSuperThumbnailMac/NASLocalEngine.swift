@@ -801,19 +801,42 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
 
 /// Runs a local file operation; a failure keeps its plain message and appends the phase plus NSError domain/code and the
 /// underlying error chain (e.g. a bare "파일을 열 수 없습니다." is NSCocoaErrorDomain 256 over a POSIX errno), so the failing site is identifiable.
+/// An already wrapped error is rethrown as is (inner phase kept, never a second `[진단: …]`); cancellation passes through unchanged.
 func withFileErrorPhase<T>(_ phase: String, _ body: () throws -> T) throws -> T {
     do {
         return try body()
+    } catch is CancellationError {
+        throw CancellationError()
     } catch let error as NSError {
-        var chain = ["\(error.domain) \(error.code)"]
-        var underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
-        while let u = underlying, chain.count < 4 {
-            chain.append("\(u.domain) \(u.code)")
-            underlying = u.userInfo[NSUnderlyingErrorKey] as? NSError
-        }
-        var info = error.userInfo
-        info[NSLocalizedDescriptionKey] = "\(error.localizedDescription) [진단: \(phase), \(chain.joined(separator: " ← "))]"
-        info[NSUnderlyingErrorKey] = error
-        throw NSError(domain: error.domain, code: error.code, userInfo: info)
+        throw fileErrorAddingPhase(error, phase: phase)
     }
+}
+
+private let fileErrorDiagnosticMarker = "[진단:"
+
+private func fileErrorChain(_ error: NSError) -> String {
+    var chain = ["\(error.domain) \(error.code)"]
+    var underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
+    while let u = underlying, chain.count < 4 {
+        chain.append("\(u.domain) \(u.code)")
+        underlying = u.userInfo[NSUnderlyingErrorKey] as? NSError
+    }
+    return chain.joined(separator: " ← ")
+}
+
+func fileErrorAddingPhase(_ error: NSError, phase: String) -> NSError {
+    if error.localizedDescription.contains(fileErrorDiagnosticMarker) { return error }
+    var info = error.userInfo
+    info[NSLocalizedDescriptionKey] = "\(error.localizedDescription) \(fileErrorDiagnosticMarker) \(phase), \(fileErrorChain(error))]"
+    info[NSUnderlyingErrorKey] = error
+    return NSError(domain: error.domain, code: error.code, userInfo: info)
+}
+
+/// Last-resort message for an unwrapped error: keeps the plain text and appends its domain/code chain, so a bare
+/// "파일을 열 수 없습니다." is never stored without its code. An already wrapped message is returned unchanged.
+func fileErrorFallbackMessage(_ error: Error) -> String {
+    let nsError = error as NSError
+    let text = nsError.localizedDescription
+    if text.contains(fileErrorDiagnosticMarker) { return text }
+    return "\(text) \(fileErrorDiagnosticMarker) 단계 미지정, \(fileErrorChain(nsError))]"
 }

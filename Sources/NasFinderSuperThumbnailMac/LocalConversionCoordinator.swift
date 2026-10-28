@@ -653,44 +653,12 @@ enum LocalConversionWorker {
             let (sourceSha256, copiedBytes, timesChangedDuringCopy) = try await { () async throws -> (String, Int64, Bool) in
                 onStageChange(.copyingSource, "원본 임시 복사 중")
 
-                let dupSourceFD = dup(sourceFD)
-                guard dupSourceFD >= 0 else {
-                    let err = errno
-                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "원본 디스크립터 복제 실패 (errno \(err))"])
-                }
-                let sourceHandle = FileHandle(fileDescriptor: dupSourceFD, closeOnDealloc: true)
-                _ = lseek(dupSourceFD, 0, SEEK_SET)
-
-                FileManager.default.createFile(atPath: sourceDestURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
-                let destHandle = try FileHandle(forWritingTo: sourceDestURL)
-                defer { try? destHandle.close() }
-
-                var hasher = SHA256()
-                var copied: Int64 = 0
-                var lastReportedPercent = -1
-                onProgress(0, "다운로드 중")
-                while true {
-                    try Task.checkCancellation()
-                    let chunk = try sourceHandle.read(upToCount: 512 * 1024) ?? Data()
-                    if chunk.isEmpty { break }
-                    hasher.update(data: chunk)
-                    copied += Int64(chunk.count)
-                    destHandle.write(chunk)
-                    if fileSize > 0 {
-                        // Cap at 0.99 until the copy size and source identity are verified.
-                        let fraction = min(0.99, Double(copied) / Double(fileSize))
-                        let percent = Int(fraction * 100)
-                        if percent != lastReportedPercent {
-                            lastReportedPercent = percent
-                            onProgress(fraction, "다운로드 중")
-                        }
-                    }
-                }
-                try destHandle.synchronize()
-
-                try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: sourceDestURL.path)
-
-                let sha = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+                let copy = try LocalSourceCopier.copy(
+                    sourceFD: sourceFD, to: sourceDestURL, fileSize: fileSize,
+                    onProgress: { fraction, label in onProgress(fraction, label) }
+                )
+                let sha = copy.sha256
+                let copied = copy.copiedBytes
 
                 // Verify identity unchanged during copy. Only mtime/ctime may differ here (dev/inode/size and the byte count must
                 // match); that case is not accepted by this check but proven right below by re-hashing the same descriptor.
@@ -861,9 +829,9 @@ enum LocalConversionWorker {
             return .failed(message: "\(uncertain.detail) [MP4·썸네일은 확인됨]")
         } catch {
             if outputPublished {
-                return .failed(message: "\(error.localizedDescription) [MP4 발행됨 · 원본 정리 미완료]")
+                return .failed(message: "\(fileErrorFallbackMessage(error)) [MP4 발행됨 · 원본 정리 미완료]")
             }
-            return .failed(message: error.localizedDescription)
+            return .failed(message: fileErrorFallbackMessage(error))
         }
     }
 }
