@@ -279,8 +279,9 @@ struct LocalFileIdentity: Hashable, Equatable, Sendable {
         return out
     }
 
-    /// True when device, inode, and size equal `other`; mtime/ctime are ignored. Only the NO-DELETE resume uses this
-    /// (WebDAV may flip the shown times of an unchanged file); every deleting path keeps requiring the exact identity.
+    /// True when device, inode, and size equal `other`; mtime/ctime are ignored. Never a permission by itself: it is used only
+    /// by no-delete paths (the resume, and the timestamp-drift proof, which also needs a full SHA-256 match and makes the attempt
+    /// retained-only). WebDAV may flip the shown times of an unchanged file; every deleting path keeps requiring the exact identity.
     func isSameFile(as other: LocalFileIdentity) -> Bool {
         device == other.device && inode == other.inode && size == other.size
     }
@@ -755,6 +756,10 @@ struct LocalJournalRecord: Codable, Equatable, Sendable {
     let createdAt: Date
     /// Vault thumbnail file name (schema 2, set once the thumbnail is verified).
     var thumbnailFileName: String?
+    /// Set (and never cleared) when this attempt published under a proven timestamp-only drift of the original. Such an
+    /// attempt is retained-only: `deleteVerifiedOriginal` refuses it, whatever the original's metadata shows later.
+    /// Absent (nil) in every earlier journal.
+    var retainedOriginalReason: LocalRetainedOriginalReason?
 
     init(
         schema: Int = LocalJournalRecord.currentSchema,
@@ -771,7 +776,8 @@ struct LocalJournalRecord: Codable, Equatable, Sendable {
         outputSha256: String,
         state: State,
         createdAt: Date = Date(),
-        thumbnailFileName: String? = nil
+        thumbnailFileName: String? = nil,
+        retainedOriginalReason: LocalRetainedOriginalReason? = nil
     ) {
         self.schema = schema
         self.attemptID = attemptID
@@ -788,6 +794,21 @@ struct LocalJournalRecord: Codable, Equatable, Sendable {
         self.state = state
         self.createdAt = createdAt
         self.thumbnailFileName = thumbnailFileName
+        self.retainedOriginalReason = retainedOriginalReason
+    }
+}
+
+/// Why an attempt may never delete its original (carried by the immutable journal).
+enum LocalRetainedOriginalReason: String, Codable, Sendable {
+    /// The mount showed other mtime/ctime for the very same file (dev/inode/size equal); its bytes were re-proven by a full SHA-256.
+    case sourceTimestampOnlyDrift = "source_timestamp_only_drift"
+
+    /// The one retained-only message shown to the user.
+    var userMessage: String {
+        switch self {
+        case .sourceTimestampOnlyDrift:
+            return "원본 보존 완료: 원본 파일 정보(시각)가 바뀌어 보였지만 내용이 같은 것을 확인했습니다. MP4·썸네일만 만들고 원본은 그대로 두었습니다."
+        }
     }
 }
 
@@ -803,6 +824,43 @@ struct LocalPublishedMP4: Sendable {
     let finalFileName: String
     let identity: LocalFileIdentity
     let record: LocalJournalRecord
+}
+
+/// Proof that the locked original's mtime/ctime changed while dev/inode/size and the full content did not. Only
+/// `LocalPublicationManager.proveSourceTimestampDrift` can create it (the initializer is file-private), and it is bound to the
+/// exact lock object, claim object + token, attempt ID and captured source SHA-256. Holding it only ever REDUCES what an
+/// attempt may do: the attempt becomes retained-only. No deleting path reads it as permission.
+struct LocalSourceDriftProof: Sendable {
+    let attemptID: String
+    let sourceSha256: String
+    let claimToken: String
+    /// The identity the lock and claim were created with.
+    let lockedIdentity: LocalFileIdentity
+    /// What the descriptor and the directory entry showed after the re-hash (times may differ from `lockedIdentity`).
+    let observedFD: LocalFileIdentity
+    let observedEntry: LocalFileIdentity
+    private let lockObject: ObjectIdentifier
+    private let claimObject: ObjectIdentifier
+
+    fileprivate init(
+        attemptID: String, sourceSha256: String, claimToken: String, lockedIdentity: LocalFileIdentity,
+        observedFD: LocalFileIdentity, observedEntry: LocalFileIdentity, lock: LocalFileLock, claim: VideoConversionClaim
+    ) {
+        self.attemptID = attemptID
+        self.sourceSha256 = sourceSha256
+        self.claimToken = claimToken
+        self.lockedIdentity = lockedIdentity
+        self.observedFD = observedFD
+        self.observedEntry = observedEntry
+        self.lockObject = ObjectIdentifier(lock)
+        self.claimObject = ObjectIdentifier(claim)
+    }
+
+    func isBound(to lock: LocalFileLock, claim: VideoConversionClaim, attemptID: String, sourceSha256: String) -> Bool {
+        lockObject == ObjectIdentifier(lock) && claimObject == ObjectIdentifier(claim)
+            && claimToken == claim.token && self.attemptID == attemptID
+            && self.sourceSha256 == sourceSha256 && lockedIdentity == lock.identity
+    }
 }
 
 /// Result of the verified Vault thumbnail for the published MP4.
@@ -889,9 +947,14 @@ enum LocalPublicationManager {
     }
 
     /// Streams the descriptor from its current offset to EOF (EINTR retried; any other read error throws).
-    static func sha256Streaming(fd: Int32) throws -> (bytes: Int64, digest: String) {
+    /// `onProgress` receives the ACTUAL bytes read so far and `expectedTotal` (only when `expectedTotal > 0`, at most once per
+    /// whole percent); it never reports completion by itself, the caller decides what the numbers mean.
+    static func sha256Streaming(
+        fd: Int32, expectedTotal: Int64 = 0, onProgress: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) throws -> (bytes: Int64, digest: String) {
         var hasher = SHA256()
         var total: Int64 = 0
+        var lastPercent = -1
         var buffer = [UInt8](repeating: 0, count: 512 * 1024)
         while true {
             try Task.checkCancellation()
@@ -901,6 +964,13 @@ enum LocalPublicationManager {
             if n == 0 { break }
             hasher.update(data: Data(buffer[0..<n]))
             total += Int64(n)
+            if let onProgress, expectedTotal > 0 {
+                let percent = Int(min(1, Double(total) / Double(expectedTotal)) * 100)
+                if percent > lastPercent {
+                    lastPercent = percent
+                    onProgress(total, expectedTotal)
+                }
+            }
         }
         return (total, hasher.finalize().map { String(format: "%02x", $0) }.joined())
     }
@@ -933,6 +1003,71 @@ enum LocalPublicationManager {
         }
     }
 
+    /// Proves that the locked original is still the SAME file with the SAME bytes although its mtime/ctime may differ
+    /// (a WebDAV mount shows other times for an unchanged file). The result makes the attempt retained-only; it never
+    /// allows a deletion (`deleteVerifiedOriginal` requires the exact identity AND a journal without a retention reason).
+    /// - webdav source only (a local volume with other times is a real modification: this throws);
+    /// - claim still this attempt's own and the parent still the pinned directory, before AND after the hash;
+    /// - the SAME locked descriptor and the named directory entry have the same dev/inode/size as the lock (before and after);
+    /// - the whole descriptor is re-read from offset 0 and its byte count and SHA-256 equal the source hash captured at copy time.
+    /// Any difference, read error, cancellation or ownership change throws and leaves every file in place.
+    /// `onHashProgress` reports the actual re-read bytes and total (never a completed upload).
+    /// `assumeWebDAVSource` is a test seam (runs the webdav branch on a local directory); it cannot enable any deletion.
+    static func proveSourceTimestampDrift(
+        sourceLock: LocalFileLock,
+        sourceSha256: String,
+        claim: VideoConversionClaim,
+        attemptID: String,
+        verifyParentPinned: (() throws -> Void)? = nil,
+        assumeWebDAVSource: Bool = false,
+        onHashProgress: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) throws -> LocalSourceDriftProof {
+        let dirFD = sourceLock.parentFD
+        let name = sourceLock.fileName
+        let locked = sourceLock.identity
+        guard sourceSha256.utf8.count == 64, sourceSha256.allSatisfy({ "0123456789abcdef".contains($0) }),
+              UUID(uuidString: attemptID)?.uuidString.lowercased() == attemptID else {
+            throw conversionError(70, "원본 시각 변동을 증명할 해시/시도 정보가 올바르지 않아 진행하지 않습니다 (원본 보존).")
+        }
+        guard assumeWebDAVSource || isWebDAV(dirFD: sourceLock.fd) else {
+            throw conversionError(71, "WebDAV가 아닌 볼륨에서 원본 시각이 바뀌어 진행하지 않습니다 (원본 보존).")
+        }
+        func requireSameObject() throws -> (fd: LocalFileIdentity, entry: LocalFileIdentity) {
+            guard let fdNow = try? LocalFileIdentity.inspect(fd: sourceLock.fd), fdNow.isSameFile(as: locked),
+                  let entryNow = try? LocalFileIdentity.inspect(dirFD: dirFD, name: name), entryNow.isSameFile(as: locked) else {
+                throw conversionError(72, "원본의 device/inode/크기 또는 디렉터리 항목이 바뀌어 진행하지 않습니다 (원본 보존).")
+            }
+            return (fdNow, entryNow)
+        }
+
+        try claim.verifyClaimBeforePublication()
+        try verifyParentPinned?()
+        _ = try requireSameObject()
+
+        guard lseek(sourceLock.fd, 0, SEEK_SET) == 0 else {
+            throw posixError(errno, "원본 재해시 위치 지정 실패 (원본 보존)")
+        }
+        let hashed: (bytes: Int64, digest: String)
+        do {
+            hashed = try sha256Streaming(fd: sourceLock.fd, expectedTotal: locked.size, onProgress: onHashProgress)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw conversionError(73, "원본 재해시 읽기 실패 (원본 보존): \(error.localizedDescription)")
+        }
+        guard hashed.bytes == locked.size, hashed.digest == sourceSha256 else {
+            throw conversionError(74, "원본 내용이 복사 시점과 달라 진행하지 않습니다 (원본 보존): 읽은 \(hashed.bytes)바이트/기대 \(locked.size)바이트, SHA-256 \(hashed.digest == sourceSha256 ? "일치" : "불일치")")
+        }
+
+        let after = try requireSameObject()
+        try claim.verifyClaimBeforePublication()
+        try verifyParentPinned?()
+        return LocalSourceDriftProof(
+            attemptID: attemptID, sourceSha256: sourceSha256, claimToken: claim.token, lockedIdentity: locked,
+            observedFD: after.fd, observedEntry: after.entry, lock: sourceLock, claim: claim
+        )
+    }
+
     /// Phase 1. Stages the engine-verified MP4 next to the original descriptor-relatively, verifies the active
     /// video claim, and exclusively publishes STEM.mp4 (no overwrite). The original keeps its own name:
     /// nothing is renamed to `_원본`. Afterwards the published file is re-opened, re-hashed and identity-bound.
@@ -944,7 +1079,12 @@ enum LocalPublicationManager {
         outputExpectedSha256: String,
         attemptID: String,
         claim: VideoConversionClaim? = nil,
-        onCopyProgress: (@Sendable (Double) -> Void)? = nil
+        sourceSha256: String? = nil,
+        driftProof: LocalSourceDriftProof? = nil,
+        verifyParentPinned: (() throws -> Void)? = nil,
+        assumeWebDAVSource: Bool = false,
+        onCopyProgress: (@Sendable (Double) -> Void)? = nil,
+        onSourceRecheckProgress: (@Sendable (Int64, Int64) -> Void)? = nil
     ) throws -> LocalPublishedMP4 {
         let dirFD = sourceLock.parentFD
         let originalFileName = sourceLock.fileName
@@ -986,16 +1126,51 @@ enum LocalPublicationManager {
             throw NSError(domain: "LocalConversionError", code: 12, userInfo: [NSLocalizedDescriptionKey: "스테이징 파일이 이미 존재합니다."])
         }
 
-        // 2. Verify source identity and directory entry match locked descriptor
-        let currentFDIdentity = try LocalFileIdentity.inspect(fd: sourceLock.fd)
-        guard currentFDIdentity == sourceLock.identity else {
-            throw NSError(domain: "LocalConversionError", code: 13, userInfo: [NSLocalizedDescriptionKey: "원본 파일 식별 정보 변경 감지"])
+        // 2. Verify source identity and directory entry match locked descriptor.
+        //    Normal attempt: the EXACT identity (every field) is required. Retained-only attempt: a proof bound to this lock, claim,
+        //    attempt and captured source SHA-256 (made by `proveSourceTimestampDrift`, or made here when the times drift later)
+        //    replaces the time comparison; such an attempt can never delete the original (journal reason), whatever the metadata
+        //    shows afterwards.
+        if let driftProof {
+            guard let claim, let sourceSha256,
+                  driftProof.isBound(to: sourceLock, claim: claim, attemptID: attemptID, sourceSha256: sourceSha256) else {
+                throw conversionError(75, "원본 시각 변동 증명이 이 원본·클레임·시도와 맞지 않아 발행하지 않습니다 (원본 보존).")
+            }
         }
+        var retainedReason: LocalRetainedOriginalReason? = driftProof == nil ? nil : .sourceTimestampOnlyDrift
+        // The newest content proof of this publication (the caller's, or one made here). It is reused ONLY while the descriptor
+        // AND the directory entry still show exactly (every field) what it observed; any other state re-hashes the original.
+        var currentProof = driftProof
 
-        let currentEntryIdentity = try LocalFileIdentity.inspect(dirFD: dirFD, name: originalFileName)
-        guard currentEntryIdentity == sourceLock.identity else {
-            throw NSError(domain: "LocalConversionError", code: 14, userInfo: [NSLocalizedDescriptionKey: "디렉터리 내 원본 파일이 다른 파일로 교체되었거나 수정되었습니다."])
+        /// Checks the original right before staging and again right before the rename. An exact match passes as before; any
+        /// other state is accepted only with the content proof (same lock/claim/attempt/hash), which also makes the attempt retained-only.
+        func requireSource(_ phase: String, fdCode: Int, entryCode: Int) throws {
+            let fdNow = try LocalFileIdentity.inspect(fd: sourceLock.fd)
+            let entryNow = try LocalFileIdentity.inspect(dirFD: dirFD, name: originalFileName)
+            if fdNow == sourceLock.identity, entryNow == sourceLock.identity { return }
+            guard let claim, let sourceSha256 else {
+                let fdDiffers = fdNow != sourceLock.identity
+                let diff = (fdDiffers ? fdNow : entryNow).differences(from: sourceLock.identity).joined(separator: ", ")
+                throw conversionError(fdDiffers ? fdCode : entryCode, "원본 파일 식별 정보 변경 감지(\(phase), \(fdDiffers ? "열린 디스크립터" : "디렉터리 항목")): \(diff)")
+            }
+            // From the first observed difference the attempt is retained-only, even if a later proof sees exact values again.
+            retainedReason = .sourceTimestampOnlyDrift
+            // Same bound proof that saw EXACTLY this descriptor and entry (all fields, never only dev/inode/size): no second read of
+            // the NAS, but the claim and the parent directory are verified again.
+            if let proof = currentProof,
+               proof.isBound(to: sourceLock, claim: claim, attemptID: attemptID, sourceSha256: sourceSha256),
+               proof.observedFD == fdNow, proof.observedEntry == entryNow {
+                try claim.verifyClaimBeforePublication()
+                try verifyParentPinned?()
+                return
+            }
+            currentProof = try proveSourceTimestampDrift(
+                sourceLock: sourceLock, sourceSha256: sourceSha256, claim: claim, attemptID: attemptID,
+                verifyParentPinned: verifyParentPinned, assumeWebDAVSource: assumeWebDAVSource,
+                onHashProgress: onSourceRecheckProgress
+            )
         }
+        try requireSource("발행 전", fdCode: 13, entryCode: 14)
 
         // 3. Stage output MP4 descriptor-relative with O_CREAT | O_EXCL | O_NOFOLLOW
         let stagedFD = openat(dirFD, stagedFileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
@@ -1077,7 +1252,7 @@ enum LocalPublicationManager {
         }
 
         // 4. Write staged journal record (original untouched)
-        let stagedJournal = LocalJournalRecord(
+        var stagedJournal = LocalJournalRecord(
             attemptID: attemptID,
             originalFileName: originalFileName,
             backupFileName: backupFileName,
@@ -1089,7 +1264,8 @@ enum LocalPublicationManager {
             sourceMtime: Int64(sourceLock.identity.mtime),
             outputSize: outputExpectedSize,
             outputSha256: outputExpectedSha256,
-            state: .outputStaged
+            state: .outputStaged,
+            retainedOriginalReason: retainedReason
         )
         try writeJournalRecord(stagedJournal, fileName: stagedJournalName, dirFD: dirFD)
 
@@ -1101,19 +1277,27 @@ enum LocalPublicationManager {
             try claim.verifyClaimBeforePublication()
         }
 
-        // Validate full source identity again immediately before publication, including nanosecond fields; keep source nlink1 admission
-        guard let finalFDIdentity = try? LocalFileIdentity.inspect(fd: sourceLock.fd),
-              finalFDIdentity == sourceLock.identity else {
+        // Validate full source identity again immediately before publication, including nanosecond fields; keep source nlink1 admission.
+        // (Retained-only: the content proof is repeated if the observed identity differs from the proof's; any failure removes only
+        // this attempt's staged files.)
+        do {
+            try requireSource("발행 직전", fdCode: 16, entryCode: 16)
+            if stagedJournal.retainedOriginalReason != retainedReason {
+                // The reason was found only now, after the staged journal was written. Persist it BEFORE the rename: the old staged
+                // journal is removed and the new one written exclusively (never an overwrite). A crash in between leaves the stage file
+                // without a journal, the same state as between steps 3 and 4 above; nothing can delete from it.
+                stagedJournal.retainedOriginalReason = retainedReason
+                guard unlinkat(dirFD, stagedJournalName, 0) == 0 || errno == ENOENT else {
+                    throw posixError(errno, "스테이징 저널 갱신 중 이전 저널 정리 실패")
+                }
+                try writeJournalRecord(stagedJournal, fileName: stagedJournalName, dirFD: dirFD)
+                // Sticky reason: this second check can only pass by an exact identity or by a (cached or new) bound proof.
+                try requireSource("발행 직전", fdCode: 16, entryCode: 16)
+            }
+        } catch {
             unlinkat(dirFD, stagedFileName, 0)
             unlinkat(dirFD, stagedJournalName, 0)
-            throw conversionError(16, "발행 직전 원본 항목 식별 정보 변경 감지")
-        }
-
-        guard let finalEntryIdentity = try? LocalFileIdentity.inspect(dirFD: dirFD, name: originalFileName),
-              finalEntryIdentity == sourceLock.identity else {
-            unlinkat(dirFD, stagedFileName, 0)
-            unlinkat(dirFD, stagedJournalName, 0)
-            throw conversionError(16, "발행 직전 원본 디렉터리 항목 식별 정보 변경 감지")
+            throw error
         }
 
         claim?.markSourceMutationStarted()
@@ -1128,10 +1312,14 @@ enum LocalPublicationManager {
             let stagedStillPresent = fstatat(dirFD, stagedFileName, &stagedStat, AT_SYMLINK_NOFOLLOW) == 0
             let currentFDIdentity = try? LocalFileIdentity.inspect(fd: sourceLock.fd)
             let currentEntryIdentity = try? LocalFileIdentity.inspect(dirFD: dirFD, name: originalFileName)
+            // Retained-only: the bytes were just re-proven, so the same dev/inode/size is the same unchanged source here.
+            func sourceUnchanged(_ identity: LocalFileIdentity?) -> Bool {
+                identity == sourceLock.identity || (retainedReason != nil && identity?.isSameFile(as: sourceLock.identity) == true)
+            }
 
             if stagedStillPresent,
-               currentFDIdentity == sourceLock.identity,
-               currentEntryIdentity == sourceLock.identity {
+               sourceUnchanged(currentFDIdentity),
+               sourceUnchanged(currentEntryIdentity) {
                 let unlinkStagedRes = unlinkat(dirFD, stagedFileName, 0)
                 let unlinkStagedErr = errno
                 let unlinkJournalRes = unlinkat(dirFD, stagedJournalName, 0)
@@ -1190,6 +1378,7 @@ enum LocalPublicationManager {
         // 9. Journal -> outputPublished (final MP4 durable and verified; original untouched)
         var publishedJournal = stagedJournal
         publishedJournal.state = .outputPublished
+        publishedJournal.retainedOriginalReason = retainedReason
         do {
             try advanceJournal(publishedJournal, to: publishedJournalName, replacing: stagedJournalName, dirFD: dirFD)
         } catch {
@@ -1645,6 +1834,10 @@ enum LocalPublicationManager {
         claim: VideoConversionClaim?,
         verifyParentPinned: () throws -> Void
     ) throws {
+        // Retained-only (timestamp-drift) attempts and their resumed journals never delete, whatever the metadata shows now.
+        guard published.record.retainedOriginalReason == nil else {
+            throw conversionError(55, "원본 보존 전용 기록(시각 변동 감지)이라 원본을 삭제하지 않습니다.")
+        }
         let dirFD = sourceLock.parentFD
         let originalFileName = sourceLock.fileName
         let stem = (originalFileName as NSString).deletingPathExtension
@@ -1827,10 +2020,52 @@ enum LocalPublicationManager {
         return Data(bytes) == expected
     }
 
+    /// Injection seam for the journal's durability syscalls. The default is the real `fsync`/`usleep`; it is an
+    /// explicit per-call argument (never global state) so tests can simulate transient and permanent sync results.
+    struct JournalSyncHooks {
+        var fsync: (Int32) -> Int32 = { Darwin.fsync($0) }
+        var sleep: (UInt32) -> Void = { _ = usleep($0) }
+    }
+
+    private enum JournalSyncOutcome {
+        case synced(retries: Int)                      // fsync really returned 0
+        case failed(errno: Int32, retries: Int)        // permanent error or retries exhausted (errno of the last failure)
+        case bindingLost(errno: Int32, retries: Int)   // the temp name stopped being the owned inode between attempts
+    }
+
+    /// fsync on the SAME descriptor, retried only for EBUSY/EAGAIN/EINTR within `journalRetryLimit`. Success is
+    /// reported only when a call returned 0. `stillBound` is rechecked before every retry; cancellation is rechecked
+    /// before every sleep and every retry and propagates as `CancellationError`.
+    private static func syncJournalDescriptor(
+        _ fd: Int32,
+        hooks: JournalSyncHooks,
+        stillBound: () -> Bool
+    ) throws -> JournalSyncOutcome {
+        var retries = 0
+        while true {
+            if hooks.fsync(fd) == 0 { return .synced(retries: retries) }
+            let err = errno
+            guard isTransientBusy(err), retries < journalRetryLimit else {
+                return .failed(errno: err, retries: retries)
+            }
+            try Task.checkCancellation()
+            retries += 1
+            hooks.sleep(journalRetryDelayMicros * UInt32(retries))
+            try Task.checkCancellation()
+            guard stillBound() else { return .bindingLost(errno: err, retries: retries) }
+        }
+    }
+
+    private static func journalSyncError(_ label: String, errno err: Int32, retries: Int, note: String = "") -> NSError {
+        let retryText = retries > 0 ? ", 재시도 \(retries)회" : ""
+        return NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "\(label) 실패 (errno \(err)\(retryText))\(note)"])
+    }
+
     static func writeJournalRecord(
         _ record: LocalJournalRecord,
         fileName: String,
-        dirFD: Int32
+        dirFD: Int32,
+        hooks: JournalSyncHooks = JournalSyncHooks()
     ) throws {
         let data = try JSONEncoder().encode(record)
 
@@ -1904,11 +2139,28 @@ enum LocalPublicationManager {
             throw NSError(domain: "LocalConversionError", code: 19, userInfo: [NSLocalizedDescriptionKey: "저널 쓰기 바이트 불일치"])
         }
 
-        if fsync(fd) != 0 {
-            let err = errno
+        // fsync stays on the same descriptor that wrote the bytes; a retry happens only while the temp name still
+        // binds the captured inode. Anything else keeps the original errno and fails without publishing.
+        let fileSync: JournalSyncOutcome
+        do {
+            fileSync = try syncJournalDescriptor(fd, hooks: hooks) {
+                tempEntryState(dirFD, tempName, owned) == .owned
+            }
+        } catch {
             closeTempFD()
             unlinkOwnedTemp(dirFD, tempName, owned)
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 fsync 실패 (errno \(err))"])
+            throw error
+        }
+        switch fileSync {
+        case .synced:
+            break
+        case .failed(let err, let retries):
+            closeTempFD()
+            unlinkOwnedTemp(dirFD, tempName, owned)
+            throw journalSyncError("저널 fsync", errno: err, retries: retries)
+        case .bindingLost(let err, let retries):
+            closeTempFD()
+            throw journalSyncError("저널 fsync", errno: err, retries: retries, note: ": 임시 항목이 생성한 파일과 달라져 삭제하지 않고 보존합니다")
         }
         closeTempFD()
 
@@ -1951,9 +2203,13 @@ enum LocalPublicationManager {
             usleep(journalRetryDelayMicros * UInt32(renameAttempt))
         }
 
-        if fsync(dirFD) != 0 {
-            let err = errno
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "디렉터리 fsync 실패 (errno \(err))"])
+        // The entry is already published; the directory sync is still a hard success requirement. Retries touch no
+        // file, and any failure (including cancellation) leaves the published journal in place and throws.
+        switch try syncJournalDescriptor(dirFD, hooks: hooks, stillBound: { true }) {
+        case .synced:
+            break
+        case .failed(let err, let retries), .bindingLost(let err, let retries):
+            throw journalSyncError("디렉터리 fsync", errno: err, retries: retries)
         }
     }
 }
@@ -2009,6 +2265,7 @@ enum LocalCrashRecovery {
                     return "이전 완료본 스테이징 중단 기록 발견 (보존됨): 원본 '\(record.originalFileName)'은 그대로입니다."
                 case .outputPublished:
                     return "이전 변환에서 MP4 '\(record.finalFileName)'는 발행되었으나 썸네일 생성/원본 정리가 끝나지 않았습니다. 원본 '\(record.originalFileName)'은 보존되어 있으며 자동 삭제하지 않습니다 (수동 확인 필요)."
+                        + (record.retainedOriginalReason == nil ? "" : " (원본 시각만 바뀐 것을 확인한 보존 전용 기록)")
                 case .deletionStarted:
                     if originalExists {
                         return "이전 변환의 원본 삭제 시작 기록이 있으나 원본 '\(record.originalFileName)'이 남아 있습니다 (보존됨, 수동 확인 필요)."

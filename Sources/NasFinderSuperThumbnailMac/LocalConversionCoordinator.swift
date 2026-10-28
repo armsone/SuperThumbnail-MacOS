@@ -199,8 +199,8 @@ enum LocalWorkerResult: Sendable {
     case failed(message: String)
     case skipped(message: String)
     case cancelled
-    /// Internal to the retry wrapper: the pre-publication attempt was aborted only because WebDAV refreshed
-    /// mtime/ctime. Never surfaced to the coordinator.
+    /// Internal to the retry wrapper: the attempt was aborted before any copy only because WebDAV refreshed
+    /// mtime/ctime between discovery and open. Never surfaced to the coordinator.
     case identityRefresh(LocalFileIdentity)
 }
 
@@ -209,6 +209,23 @@ final class LocalAttemptCleanupState: @unchecked Sendable {
     private let lock = NSLock()
     private var claimPending = false
     private var workspacePending = false
+    private var claimNotice: String?
+
+    /// Exact leftovers for the "cleanup not confirmed" message (diagnostics only; never changes the retry decision).
+    var pendingSummary: String {
+        lock.lock()
+        defer { lock.unlock() }
+        var parts: [String] = []
+        if claimPending { parts.append("클레임: \(claimNotice ?? "해제 결과 없음")") }
+        if workspacePending { parts.append("작업공간 삭제 미확인") }
+        return parts.joined(separator: " / ")
+    }
+
+    func setClaimNotice(_ notice: String?) {
+        lock.lock()
+        claimNotice = notice
+        lock.unlock()
+    }
 
     var isFullyCleaned: Bool {
         lock.lock()
@@ -227,11 +244,6 @@ final class LocalAttemptCleanupState: @unchecked Sendable {
         workspacePending = pending
         lock.unlock()
     }
-}
-
-/// Thrown after the copy phase when only mtime/ctime of the same WebDAV file changed.
-struct LocalIdentityRefreshRequest: Error {
-    let refreshed: LocalFileIdentity
 }
 
 /// The preclaim source `openat` kept returning EINTR: a real connection interruption, never an owner conflict.
@@ -301,10 +313,11 @@ enum LocalConversionWorker {
         return name == "webdav"
     }
 
-    /// WebDAV can serve cached mtime/ctime that refresh after a read. When a pre-publication check finds ONLY that
-    /// (same dev/inode/size, full byte count), the failed attempt is cleaned up completely (claim released, fds
-    /// closed, workspace removed, download slot freed) and exactly ONE new whole attempt runs with a fresh
-    /// descriptor, attempt ID, claim, and hash, pinned to the refreshed identity. No further refresh is allowed.
+    /// WebDAV can serve cached mtime/ctime that differ from the listing. When the open (before any copy) finds ONLY that
+    /// (same dev/inode/size), the attempt is cleaned up completely (claim released, fds closed, workspace removed, download
+    /// slot freed) and exactly ONE new whole attempt runs with a fresh descriptor, attempt ID, claim, and hash, pinned to the
+    /// refreshed identity. Times that change AFTER the copy are never re-downloaded: the same locked descriptor is re-hashed
+    /// (`proveSourceTimestampDrift`) and the validated copy continues as a retained-only attempt (original never deleted).
     nonisolated static func performConversion(
         context: LocalAttemptContext,
         pinnedRoot: NASPinnedRoot,
@@ -333,7 +346,9 @@ enum LocalConversionWorker {
 
         // All defers of the first attempt have run. Without confirmed cleanup (e.g. claim not released) never retry.
         guard cleanup.isFullyCleaned else {
-            return .skipped(message: "원본 정보 변경 감지 후 정리를 확인하지 못해 재시도하지 않습니다(원본 유지)")
+            let detail = cleanup.pendingSummary
+            let refreshDiff = refreshed.differences(from: context.expectedIdentity).joined(separator: ", ")
+            return .skipped(message: "원본 정보 변경 감지 후 정리를 확인하지 못해 재시도하지 않습니다(원본 유지): 미정리 [\(detail)] · 변경 [\(refreshDiff)]")
         }
         if Task.isCancelled { return .cancelled }
         onStageChange(.preparing, "원본 정보 새로 확인 중")
@@ -523,7 +538,9 @@ enum LocalConversionWorker {
         var conversionSucceeded = false
         cleanup.setClaimPending(true)
         defer {
-            if claim.release(success: conversionSucceeded) == nil {
+            let notice = claim.release(success: conversionSucceeded)
+            cleanup.setClaimNotice(notice)
+            if notice == nil {
                 cleanup.setClaimPending(false)
             }
         }
@@ -555,6 +572,9 @@ enum LocalConversionWorker {
                     resumedPublication: true
                 )
                 conversionSucceeded = true
+                if let reason = published.record.retainedOriginalReason {
+                    return .completed(message: reason.userMessage)
+                }
                 return .completed(message: "이전 변환의 MP4·썸네일 확인 완료 (원본 보존, 삭제하지 않음)")
             } catch is CancellationError {
                 return .cancelled
@@ -602,6 +622,22 @@ enum LocalConversionWorker {
             }
         }
 
+        // Root -> parent must still be the pinned parent directory (used before the drift proof, publication and deletion).
+        let verifyParentPinned: () throws -> Void = {
+            try pinnedRoot.withDirectoryFD { rootFD in
+                let verifyParentFD = try NASPinnedFS.openDirectoryChain(rootFD, parentComponents, create: false)
+                defer { Darwin.close(verifyParentFD) }
+                var parentStat = stat()
+                var lockParentStat = stat()
+                guard fstat(verifyParentFD, &parentStat) == 0,
+                      fstat(lock.parentFD, &lockParentStat) == 0,
+                      parentStat.st_dev == lockParentStat.st_dev,
+                      parentStat.st_ino == lockParentStat.st_ino else {
+                    throw NSError(domain: "LocalConversionError", code: 40, userInfo: [NSLocalizedDescriptionKey: "상위 디렉터리 격리 검증 실패 (부모 디렉터리 불일치)"])
+                }
+            }
+        }
+
         do {
             try Task.checkCancellation()
 
@@ -614,7 +650,7 @@ enum LocalConversionWorker {
 
             let sourceFD = lock.fd
             let expectedIdentity = lock.identity
-            let (sourceSha256, copiedBytes) = try await { () async throws -> (String, Int64) in
+            let (sourceSha256, copiedBytes, timesChangedDuringCopy) = try await { () async throws -> (String, Int64, Bool) in
                 onStageChange(.copyingSource, "원본 임시 복사 중")
 
                 let dupSourceFD = dup(sourceFD)
@@ -656,21 +692,38 @@ enum LocalConversionWorker {
 
                 let sha = hasher.finalize().map { String(format: "%02x", $0) }.joined()
 
-                // Verify identity unchanged during copy
+                // Verify identity unchanged during copy. Only mtime/ctime may differ here (dev/inode/size and the byte count must
+                // match); that case is not accepted by this check but proven right below by re-hashing the same descriptor.
                 let postCopyIdentity = try LocalFileIdentity.inspect(fd: sourceFD)
-                guard postCopyIdentity == expectedIdentity, copied == fileSize else {
-                    if allowIdentityRefresh, copied == fileSize, isWebDAV(fd: sourceFD),
-                       postCopyIdentity.isTimestampOnlyDrift(from: expectedIdentity) {
-                        throw LocalIdentityRefreshRequest(refreshed: postCopyIdentity)
-                    }
+                guard postCopyIdentity.isSameFile(as: expectedIdentity), copied == fileSize else {
                     var detail = postCopyIdentity.differences(from: expectedIdentity)
                     if copied != fileSize { detail.append("복사 바이트(\(copied)≠목록 크기 \(fileSize))") }
                     throw NSError(domain: "LocalConversionError", code: 30, userInfo: [NSLocalizedDescriptionKey: "복사 전후 원본 파일 식별 정보 불일치(원본 유지): \(detail.joined(separator: ", "))"])
                 }
 
-                onProgress(1, "다운로드 완료 · 인코딩 대기")
-                return (sha, copied)
+                let timesChanged = postCopyIdentity != expectedIdentity
+                // Times moved: the source is read once more below, so the download is not announced as complete yet.
+                if !timesChanged { onProgress(1, "다운로드 완료 · 인코딩 대기") }
+                return (sha, copied, timesChanged)
             }()
+
+            // Times moved during the copy: do NOT throw the validated copy away. Re-hash the SAME locked descriptor (the download
+            // slot is still held, this reads the NAS again) and require the full SHA-256 of the copy. Success only makes this a
+            // retained-only attempt; every mismatch, error, cancellation or ownership change throws with the original untouched.
+            var driftProof: LocalSourceDriftProof?
+            if timesChangedDuringCopy {
+                onStageChange(.verifying, "원본 정보 변경 확인 중 (내용 재확인)")
+                onProgress(0, "원본 재확인 중")
+                driftProof = try LocalPublicationManager.proveSourceTimestampDrift(
+                    sourceLock: lock, sourceSha256: sourceSha256, claim: claim, attemptID: attemptID,
+                    verifyParentPinned: verifyParentPinned,
+                    onHashProgress: { done, total in
+                        // Actual bytes re-read; never 100% before the proof itself has finished.
+                        onProgress(min(0.99, Double(done) / Double(total)), "원본 재확인 중")
+                    }
+                )
+                onProgress(1, "다운로드 완료 · 인코딩 대기")
+            }
             // Copy finished: free the download slot so the next file can start while this one encodes.
             await downloadPermit.release()
             claim.updatePhase("copyingSource")
@@ -718,21 +771,7 @@ enum LocalConversionWorker {
                 throw NSError(domain: "LocalConversionError", code: 33, userInfo: [NSLocalizedDescriptionKey: "엔진 출력 파일이 생성되지 않았습니다."])
             }
 
-            // 8. Validate root->parent still matches pinned parent (re-used right before publication and deletion)
-            let verifyParentPinned: () throws -> Void = {
-                try pinnedRoot.withDirectoryFD { rootFD in
-                    let verifyParentFD = try NASPinnedFS.openDirectoryChain(rootFD, parentComponents, create: false)
-                    defer { Darwin.close(verifyParentFD) }
-                    var parentStat = stat()
-                    var lockParentStat = stat()
-                    guard fstat(verifyParentFD, &parentStat) == 0,
-                          fstat(lock.parentFD, &lockParentStat) == 0,
-                          parentStat.st_dev == lockParentStat.st_dev,
-                          parentStat.st_ino == lockParentStat.st_ino else {
-                        throw NSError(domain: "LocalConversionError", code: 40, userInfo: [NSLocalizedDescriptionKey: "상위 디렉터리 격리 검증 실패 (부모 디렉터리 불일치)"])
-                    }
-                }
-            }
+            // 8. Validate root->parent still matches pinned parent (closure defined before the copy; re-used before publication and deletion)
             try verifyParentPinned()
 
             // 9. Check cancellation before irreversible publication
@@ -749,8 +788,15 @@ enum LocalConversionWorker {
                 outputExpectedSha256: outputSummary.sha256,
                 attemptID: attemptID,
                 claim: claim,
+                sourceSha256: sourceSha256,
+                driftProof: driftProof,
+                verifyParentPinned: verifyParentPinned,
                 onCopyProgress: { fraction in
                     onProgress(fraction, "완료본 저장 중")
+                },
+                onSourceRecheckProgress: { done, total in
+                    // Re-read of the original inside the publication; its own label, and the upload label/100% stay untouched.
+                    onProgress(min(0.99, Double(done) / Double(total)), "원본 재확인 중")
                 }
             )
             outputPublished = true
@@ -767,6 +813,14 @@ enum LocalConversionWorker {
                 published: published,
                 finalURL: finalURL
             )
+
+            // 11a. Retained-only: the original's times changed (during the copy, or later before publication) and its bytes were
+            //      re-proven. The journal carries the reason, so the original is never deleted here, even if the mount shows the old
+            //      times again. Independent of the engine flag.
+            if let reason = published.record.retainedOriginalReason {
+                conversionSucceeded = true
+                return .completed(message: reason.userMessage)
+            }
 
             // 11b. Repaired-clock output: MP4 and thumbnail are verified and published, but the original is KEPT.
             //      Decided only by the engine's structured flag (deleted only when it is explicitly false), never by message text.
@@ -796,8 +850,6 @@ enum LocalConversionWorker {
             conversionSucceeded = true
             return .completed(message: "변환 완료 (MP4·썸네일 확인 후 원본 정리됨)")
 
-        } catch let refresh as LocalIdentityRefreshRequest {
-            return .identityRefresh(refresh.refreshed)
         } catch is CancellationError {
             engineBridge.cancel(ref: engineRef)
             if outputPublished {

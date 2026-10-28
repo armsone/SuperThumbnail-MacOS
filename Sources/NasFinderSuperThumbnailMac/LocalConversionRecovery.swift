@@ -853,6 +853,7 @@ enum LocalConversionRecovery {
                   temp.sourceMtime == published.sourceMtime,
                   temp.outputSize == published.outputSize,
                   temp.outputSha256 == published.outputSha256,
+                  temp.retainedOriginalReason == published.retainedOriginalReason,
                   temp.createdAt == published.createdAt else {
                 throw fail("내용이 있는 저널 임시 파일이 이 시도의 발행 기록과 정확히 맞지 않아 남겨 둠: \(name)")
             }
