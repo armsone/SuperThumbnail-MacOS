@@ -457,6 +457,21 @@ final class LocalRecoveryScopeTests: XCTestCase {
         XCTAssertEqual(admitWith(failedPaths: []).count, 4)
     }
 
+    func testTerminalSkippedOrCompletedPathIsNotAdmittedAgainInThisRunButSiblingsAre() {
+        let folder = UUID()
+        let done = synthetic(folder, ["Caution", "SKYANGEL_AIKOHIROSE.avi"], mtime: 100)
+        let drifted = synthetic(folder, ["Caution", "SKYANGEL_AIKOHIROSE.avi"], mtime: 500, inode: 9)
+        let sibling = synthetic(folder, ["Caution", "other.avi"], inode: 10)
+        let processed: Set<String> = [key(done)]   // recorded for completed, failed and skipped alike
+        let admitted = LocalConversionCoordinator.admitFeedCandidates(
+            [drifted, sibling], active: [], activePaths: [], failed: [], failedPaths: processed, pending: []
+        )
+        XCTAssertEqual(admitted.map(\.relativePath), ["Caution/other.avi"])
+        // queued duplicate is removed without touching the sibling
+        let kept = LocalConversionCoordinator.removingPendingPaths(processed, from: [drifted, sibling])
+        XCTAssertEqual(kept.map(\.identity), [sibling.identity])
+    }
+
     func testFeedOrderPutsPriorityFirstThenResumesWithoutInspectingAFileTwice() {
         let id = UUID()
         func t(_ n: String) -> LocalRetryTarget { LocalRetryTarget(folderID: id, components: ["D", n]) }

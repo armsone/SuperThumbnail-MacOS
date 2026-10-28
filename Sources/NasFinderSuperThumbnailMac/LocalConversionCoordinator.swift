@@ -958,10 +958,11 @@ final class LocalConversionCoordinator: ObservableObject {
     private var pendingCandidates: [LocalDiscoveredFile] = []
     private var currentRunGeneration: Int = 0
     private var failedIdentitiesInPass: Set<LocalFileIdentity> = []
-    /// Folder + relative path keys that failed in this run. WebDAV changes a file's timestamps while it is copied, so the same
-    /// file comes back with a new identity; the path is what stops a re-download/re-encode of a proven failure. Cleared at the
-    /// start of every run, so the next run (or an explicit retry) can try the path again.
-    private var failedPathsInPass: Set<String> = []
+    /// Folder + relative path keys that reached a terminal result (completed, failed or skipped) in this run. WebDAV changes a
+    /// file's timestamps while it is copied, so the same file comes back with a new identity; the path is what stops a second
+    /// attempt (and a second history record) in the same run. Cancellation is not terminal. Cleared at the start of every run,
+    /// so the next run (or an explicit retry) can try the path again.
+    private var processedPathsInPass: Set<String> = []
     /// Remaining incremental inspections (priority retries, then known published-MP4 resumes) of the unified start. It counts as
     /// pending work: the run cannot finish while it exists.
     private var priorityFeed: PriorityFeed?
@@ -1541,7 +1542,7 @@ final class LocalConversionCoordinator: ObservableObject {
             active: Set(activeItems.map(\.identity)),
             activePaths: Set(activeItems.map { Self.pathKey(folderID: $0.folderID, components: $0.relativeComponents) }),
             failed: failedIdentitiesInPass,
-            failedPaths: failedPathsInPass,
+            failedPaths: processedPathsInPass,
             pending: pendingCandidates
         )
     }
@@ -1709,7 +1710,7 @@ final class LocalConversionCoordinator: ObservableObject {
         priorityFeed = feed
         priorityFeed?.generation = currentRunGeneration
         failedIdentitiesInPass.removeAll()
-        failedPathsInPass.removeAll()
+        processedPathsInPass.removeAll()
         isTargetedRetry = false
         targetedTotal = 0
 
@@ -1729,7 +1730,7 @@ final class LocalConversionCoordinator: ObservableObject {
         guard preflightConversionTools() else { return }
         currentRunGeneration += 1
         failedIdentitiesInPass.removeAll()
-        failedPathsInPass.removeAll()
+        processedPathsInPass.removeAll()
         pendingCandidates = candidates
         targetedTotal = candidates.count
         isTargetedRetry = true
@@ -1882,6 +1883,7 @@ final class LocalConversionCoordinator: ObservableObject {
 
         guard let pin = folderPins[folderID]?.duplicate() else {
             counters.skippedCount += 1
+            markPathProcessed(candidate)
             appendRecentItem(
                 LocalConversionItem(
                     id: itemID,
@@ -1903,6 +1905,7 @@ final class LocalConversionCoordinator: ObservableObject {
         guard let lease = LocalRecoveryExclusion.shared.acquireShared() else {
             pin.close()
             counters.skippedCount += 1
+            markPathProcessed(candidate)
             appendRecentItem(
                 LocalConversionItem(
                     id: itemID,
@@ -1991,32 +1994,40 @@ final class LocalConversionCoordinator: ObservableObject {
         updateQueueSummary()
     }
 
+    /// Records a terminal path for this run and drops queued-but-not-started duplicates of it. Those were never counted as
+    /// discovered, so the counters stay untouched; a targeted retry's denominator shrinks with them.
+    private func markPathProcessed(_ candidate: LocalDiscoveredFile) {
+        let key = Self.pathKey(folderID: candidate.folderID, components: candidate.relativeComponents)
+        processedPathsInPass.insert(key)
+        let remaining = Self.removingPendingPaths([key], from: pendingCandidates)
+        if remaining.count != pendingCandidates.count {
+            if isTargetedRetry { targetedTotal -= pendingCandidates.count - remaining.count }
+            pendingCandidates = remaining
+        }
+    }
+
     private func handleWorkerResult(candidate: LocalDiscoveredFile, result: LocalWorkerResult) {
         let itemID = candidate.id
         switch result {
         case .completed(let msg):
             counters.completedCount += 1
+            markPathProcessed(candidate)
             updateItemStage(itemID, stage: .completed, message: msg)
         case .failed(let msg):
             counters.failedCount += 1
             failedIdentitiesInPass.insert(candidate.identity)
-            let failedKey = Self.pathKey(folderID: candidate.folderID, components: candidate.relativeComponents)
-            failedPathsInPass.insert(failedKey)
-            let remaining = Self.removingPendingPaths([failedKey], from: pendingCandidates)
-            if remaining.count != pendingCandidates.count {
-                // A targeted retry's denominator is its explicit list: shrink it with the dropped duplicates.
-                if isTargetedRetry { targetedTotal -= pendingCandidates.count - remaining.count }
-                pendingCandidates = remaining
-            }
+            markPathProcessed(candidate)
             updateItemStage(itemID, stage: .failed(msg), message: "오류: \(msg)")
         case .skipped(let msg):
             counters.skippedCount += 1
+            markPathProcessed(candidate)
             updateItemStage(itemID, stage: .skipped(msg), message: msg)
         case .cancelled:
             updateItemStage(itemID, stage: .cancelled, message: "작업 취소됨")
         case .identityRefresh:
             // Resolved inside the worker; defensively treated as a safe skip (original kept).
             counters.skippedCount += 1
+            markPathProcessed(candidate)
             updateItemStage(itemID, stage: .skipped("원본 정보 변경으로 건너뜀(원본 유지)"), message: "원본 정보 변경으로 건너뜀")
         }
 
