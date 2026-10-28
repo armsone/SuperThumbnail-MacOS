@@ -334,9 +334,81 @@ final class LocalRecoveryScopeTests: XCTestCase {
         let a = candidate("a.avi"), b = candidate("b.avi"), c = candidate("c.avi"), d = candidate("d.avi")
         // a failed earlier in this pass (e.g. by the folder scan), b is encoding, c is already queued; d is new (offered twice)
         let admitted = LocalConversionCoordinator.admitFeedCandidates(
-            [a, b, c, d, d], active: [b.identity], failed: [a.identity], pending: [c]
+            [a, b, c, d, d], active: [b.identity], activePaths: [], failed: [a.identity], pending: [c]
         )
         XCTAssertEqual(admitted.map { $0.relativeComponents.last }, ["d.avi"])
+    }
+
+    // MARK: Same-path queue admission (WebDAV changes timestamps of a file that is already being copied)
+
+    private func synthetic(_ folder: UUID, _ components: [String], mtime: time_t = 100, inode: ino_t = 7) -> LocalDiscoveredFile {
+        LocalDiscoveredFile(
+            folderID: folder,
+            url: URL(fileURLWithPath: "/tmp/q/" + components.joined(separator: "/")),
+            relativePath: components.joined(separator: "/"),
+            relativeComponents: components,
+            fileSize: 10,
+            identity: LocalFileIdentity(device: 1, inode: inode, size: 10, mtime: mtime, mtime_nsec: 5, ctime: mtime, ctime_nsec: 5)
+        )
+    }
+
+    private func admit(
+        _ candidates: [LocalDiscoveredFile], activePaths: [LocalDiscoveredFile] = [], pending: [LocalDiscoveredFile] = []
+    ) -> [LocalDiscoveredFile] {
+        LocalConversionCoordinator.admitFeedCandidates(
+            candidates,
+            active: Set(activePaths.map(\.identity)),
+            activePaths: Set(activePaths.map { LocalConversionCoordinator.pathKey(folderID: $0.folderID, components: $0.relativeComponents) }),
+            failed: [],
+            pending: pending
+        )
+    }
+
+    func testActivePathIsNotAdmittedAgainWhenOnlyItsTimestampsChanged() {
+        let folder = UUID()
+        let active = synthetic(folder, ["Caution", "HHH", "episode1.wmv"], mtime: 100)
+        let drifted = synthetic(folder, ["Caution", "HHH", "episode1.wmv"], mtime: 200)   // same path, WebDAV-shifted mtime/ctime
+        XCTAssertNotEqual(active.identity, drifted.identity)
+        XCTAssertTrue(admit([drifted], activePaths: [active]).isEmpty)
+    }
+
+    func testActivePathIsNotAdmittedAgainWhenTheInodeAlsoChanged() {
+        let folder = UUID()
+        let active = synthetic(folder, ["Caution", "episode1.wmv"], inode: 7)
+        XCTAssertTrue(admit([synthetic(folder, ["Caution", "episode1.wmv"], mtime: 300, inode: 9)], activePaths: [active]).isEmpty)
+    }
+
+    func testPendingPathIsNotQueuedTwiceEvenWithChangedTimestampsOrNFCNFDSpelling() {
+        let folder = UUID()
+        let nfc = "\u{D55C}\u{AE00}.wmv"                       // precomposed Hangul
+        let nfd = nfc.decomposedStringWithCanonicalMapping       // jamo sequence, canonically equivalent
+        XCTAssertNotEqual(Array(nfc.unicodeScalars), Array(nfd.unicodeScalars))
+        let queued = synthetic(folder, ["Caution", nfc], mtime: 100)
+        XCTAssertTrue(admit([synthetic(folder, ["Caution", nfc], mtime: 250)], pending: [queued]).isEmpty)
+        XCTAssertTrue(admit([synthetic(folder, ["Caution", nfd], mtime: 250)], pending: [queued]).isEmpty)
+        XCTAssertTrue(admit([synthetic(folder, ["Caution", nfd], mtime: 250)], activePaths: [queued]).isEmpty)
+        // the batch itself is deduplicated as well
+        XCTAssertEqual(admit([synthetic(folder, ["Caution", nfc], mtime: 1), synthetic(folder, ["Caution", nfd], mtime: 2)]).count, 1)
+    }
+
+    func testDifferentFilesStayAdmittedWhileAnotherPathIsActive() {
+        let folder = UUID(), otherFolder = UUID()
+        let active = synthetic(folder, ["Caution", "episode1.wmv"])
+        let sibling = synthetic(folder, ["Caution", "episode2.wmv"], inode: 8)
+        let caseDiffers = synthetic(folder, ["Caution", "Episode1.wmv"], inode: 9)
+        let otherDirectory = synthetic(folder, ["Other", "episode1.wmv"], inode: 10)
+        let otherSelectedFolder = synthetic(otherFolder, ["Caution", "episode1.wmv"], inode: 11)
+        let admitted = admit([sibling, caseDiffers, otherDirectory, otherSelectedFolder], activePaths: [active])
+        XCTAssertEqual(admitted.map(\.relativePath), ["Caution/episode2.wmv", "Caution/Episode1.wmv", "Other/episode1.wmv", "Caution/episode1.wmv"])
+    }
+
+    func testSamePathIsAdmittedAgainOnTheNextRunWithChangedFile() {
+        let folder = UUID()
+        let first = synthetic(folder, ["Caution", "episode1.wmv"], mtime: 100)
+        XCTAssertTrue(admit([synthetic(folder, ["Caution", "episode1.wmv"], mtime: 200)], activePaths: [first]).isEmpty)
+        // run ended: nothing is active or pending any more (no per-path memory survives), so an explicit retry or the changed file is admitted
+        let changed = synthetic(folder, ["Caution", "episode1.wmv"], mtime: 900)
+        XCTAssertEqual(admit([changed]).map(\.identity), [changed.identity])
     }
 
     func testFeedOrderPutsPriorityFirstThenResumesWithoutInspectingAFileTwice() {

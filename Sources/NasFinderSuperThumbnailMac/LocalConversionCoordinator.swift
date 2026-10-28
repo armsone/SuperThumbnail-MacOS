@@ -1448,23 +1448,43 @@ final class LocalConversionCoordinator: ObservableObject {
         activeCount == 0 && inFlightPulls == 0 && pendingCount == 0 && !feederPending
     }
 
-    /// Candidates the feeder may add: not active, not already failed in this pass, not already queued (same identity or path),
-    /// and not repeated inside the batch itself. The folder scan applies the same identity rules.
+    /// Folder + relative path of a queue entry. Swift `String` equality/hashing is canonical Unicode equivalence, so an NFC/NFD
+    /// respelling of the same name is the same key, while a different case or a different folder is not.
+    nonisolated static func pathKey(folderID: UUID, components: [String]) -> String {
+        "\(folderID.uuidString)/\(components.joined(separator: "/"))"
+    }
+
+    /// Candidates the feeder or the folder scan may add: not active (same identity OR same path, because WebDAV may change the
+    /// timestamps of a file that is already being copied), not already failed in this pass, not already queued (same identity or
+    /// path), and not repeated inside the batch itself. Nothing is remembered across runs, so the next run can retry a path.
     nonisolated static func admitFeedCandidates(
-        _ candidates: [LocalDiscoveredFile], active: Set<LocalFileIdentity>, failed: Set<LocalFileIdentity>, pending: [LocalDiscoveredFile]
+        _ candidates: [LocalDiscoveredFile], active: Set<LocalFileIdentity>, activePaths: Set<String>,
+        failed: Set<LocalFileIdentity>, pending: [LocalDiscoveredFile]
     ) -> [LocalDiscoveredFile] {
-        func key(_ c: LocalDiscoveredFile) -> String { "\(c.folderID.uuidString)/\(c.relativeComponents.joined(separator: "/"))" }
+        func key(_ c: LocalDiscoveredFile) -> String { pathKey(folderID: c.folderID, components: c.relativeComponents) }
         var seenKeys = Set(pending.map(key))
         var seenIdentities = Set(pending.map(\.identity))
         var admitted: [LocalDiscoveredFile] = []
         for candidate in candidates
-        where !active.contains(candidate.identity) && !failed.contains(candidate.identity)
+        where !active.contains(candidate.identity) && !activePaths.contains(key(candidate)) && !failed.contains(candidate.identity)
             && !seenIdentities.contains(candidate.identity) && !seenKeys.contains(key(candidate)) {
             seenKeys.insert(key(candidate))
             seenIdentities.insert(candidate.identity)
             admitted.append(candidate)
         }
         return admitted
+    }
+
+    /// Single admission point on the MainActor for both the priority feeder and the folder-scan pull (the scan can reach a path
+    /// the feeder queued or started while its off-main pull was in flight).
+    private func admitDiscovered(_ candidates: [LocalDiscoveredFile]) -> [LocalDiscoveredFile] {
+        Self.admitFeedCandidates(
+            candidates,
+            active: Set(activeItems.map(\.identity)),
+            activePaths: Set(activeItems.map { Self.pathKey(folderID: $0.folderID, components: $0.relativeComponents) }),
+            failed: failedIdentitiesInPass,
+            pending: pendingCandidates
+        )
     }
 
     nonisolated static func inspectFeedItem(_ item: PriorityFeedItem, folders: [LocalFolderItem], pins: [UUID: NASPinnedRoot]) -> LocalRetryInspection {
@@ -1527,10 +1547,7 @@ final class LocalConversionCoordinator: ObservableObject {
         feed.inFlight = false
         priorityFeed = feed
         recoveryDetails += one.errors.map { "[폴더 오류] \($0)" } + one.notes.map { "[건너뜀] \($0)" }
-        let admitted = Self.admitFeedCandidates(
-            one.candidates, active: Set(activeItems.map(\.identity)), failed: failedIdentitiesInPass, pending: pendingCandidates
-        )
-        pendingCandidates.append(contentsOf: admitted)
+        pendingCandidates.append(contentsOf: admitDiscovered(one.candidates))
         scheduleWork()
     }
 
@@ -1762,6 +1779,10 @@ final class LocalConversionCoordinator: ObservableObject {
 
                 self.inFlightPulls = max(0, self.inFlightPulls - 1)
                 self.isSearching = (self.inFlightPulls > 0)
+
+                // The scan only knew the active/pending sets from when the pull began: drop a path that has been queued or
+                // started since (its cursor position is consumed; the next pull continues with the next file).
+                let candidate = candidate.flatMap { self.admitDiscovered([$0]).first }
 
                 if self.isPaused {
                     if let candidate {
