@@ -163,6 +163,8 @@ final class VideoConversionClaim: @unchecked Sendable {
         let key = computeKey(finalMP4FileName: outputName)
         let claimDirName = "\(key).claim"
 
+        // Exclusion against cleanup is held by the caller's shared device lease (atomic); no check-then-act here.
+
         // 1. Ensure hidden root container .NasFinder-Video-v1 exists under parentFD
         if mkdirat(parentFD, containerDirName, 0o755) != 0 {
             let err = errno
@@ -488,7 +490,7 @@ final class VideoConversionClaim: @unchecked Sendable {
     /// 유령은 openat/fstat는 성공하지만 fdopendir(childFD)가 NULL과 errno=ENOENT로 실패한다(readdir 이전).
     /// 실제 하위 디렉터리는 fdopendir가 성공하므로 유령으로 인정하지 않는다.
     /// 그 외 모든 실패(open/fstat/다른 errno)는 fail closed(false)이다.
-    private static func isWebDAVPhantomSelfEntry(parentFD: Int32, name: String) -> Bool {
+    static func isWebDAVPhantomSelfEntry(parentFD: Int32, name: String) -> Bool {
         let probeFD = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard probeFD >= 0 else { return false }
         var probeStat = stat()
@@ -509,7 +511,7 @@ final class VideoConversionClaim: @unchecked Sendable {
     }
 
     /// 알려진 네트워크 파일시스템(webdav, smbfs)인지 판별한다. 실패 시 fail closed(false).
-    private static func isNetworkFilesystem(fd: Int32) -> Bool {
+    static func isNetworkFilesystem(fd: Int32) -> Bool {
         var fs = statfs()
         guard fstatfs(fd, &fs) == 0 else { return false }
         let name = withUnsafeBytes(of: fs.f_fstypename) { raw -> String in
@@ -520,12 +522,16 @@ final class VideoConversionClaim: @unchecked Sendable {
     }
 
     /// macOS가 네트워크 파일시스템에 자동 생성하는 AppleDouble 사이드카 중 우리 토큰의 정확한 파일명만 해당한다.
-    private var ownAppleDoubleNames: [String] {
+    static func ownAppleDoubleNames(token: String) -> [String] {
         ["._owner-\(token).json", "._hb-\(token).json", "._hb-\(token).json.tmp"]
     }
 
+    private var ownAppleDoubleNames: [String] {
+        Self.ownAppleDoubleNames(token: token)
+    }
+
     /// 사이드카가 nofollow 단일 링크 일반 파일이고 크기가 제한 이내이며 AppleDouble 매직(0x00051607)을 가졌는지 검증한다.
-    private static func isValidAppleDoubleFile(dirFD: Int32, name: String) -> Bool {
+    static func isValidAppleDoubleFile(dirFD: Int32, name: String) -> Bool {
         let fd = openat(dirFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }

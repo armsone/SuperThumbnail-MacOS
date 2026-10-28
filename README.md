@@ -32,6 +32,30 @@ swift build -c release
 ./build_app.sh
 ```
 
+- 영상 변환 도구는 앱에 내장됩니다: `Resources/Runtime/{arm64,x86_64}/bin/{ffmpeg,ffprobe}`와 `Resources/Runtime/{arm64,x86_64}/python/bin/python3`(독립 Python 트리)가 두 아키텍처 모두 있어야 `build_app.sh`가 진행되며, 없으면 Swift 빌드 전에 중단합니다. 런타임 내용물은 Git에 올리지 않고(`README.md`·`MANIFEST.json`만 예외) 빌드 때 앱에 복사하며, 모든 Mach-O는 바깥 앱보다 먼저 서명합니다. 앱은 내장 런타임을 먼저 쓰고 개발용으로만 Homebrew/시스템 폴더를 대신 사용합니다.
+- 변환 기록 창의 '진단 내용 복사'는 앱 버전·macOS·도구 위치·모든 실패/건너뜀 사유를 클립보드에 복사합니다(자동 전송 없음).
 - 최소 지원 버전: macOS 14 (Sonoma) 이상
-- `build_app.sh`는 기본적으로 버전 `2.7.3`의 유니버설 바이너리(`arm64` + `x86_64`) 앱 번들을 생성합니다.
+- `build_app.sh`는 기본적으로 버전 `2.7.16`의 유니버설 바이너리(`arm64` + `x86_64`) 앱 번들을 생성합니다.
 - Sparkle 2.9.4 기반 자동 업데이트 지원
+- 업데이트 확인·다운로드는 언제든 진행하지만, 설치(종료 후 재실행)는 수퍼썸네일 생성·파일 검색·보관함 정리·영상 변환/준비/복구·NAS 영상 변환 돕기가 모두 끝난 뒤로 미룹니다. 대기 중에는 앱 메뉴에 "업데이트 x.y.z 설치 대기 중" 상태가 표시되고, 유휴가 되면 Sparkle 델리게이트로 자동 설치합니다(창이 열려 있지 않아도 동작). 사용자가 직접 앱을 종료하면 Sparkle이 예약된 업데이트를 설치합니다.
+
+### 자동 업데이트 배포 (받는 Mac에는 키·설정이 필요 없음)
+
+받는 Mac은 앱에 들어 있는 공개키(`SUPublicEDKey`)로 업데이트를 검증하므로 별도 키나 설정이 필요 없습니다. 앱은 6시간마다 확인하고, 자동 다운로드 설정이 켜져 있으면 내려받아 작업이 없을 때 설치·재실행합니다. 배포하는 Mac에는 아래가 필요합니다.
+
+- 로그인 Keychain에 `Developer ID Application` 인증서와 Sparkle EdDSA 개인키(`Sparkle/sparkle_ed_public_key.txt`의 공개키와 짝). 개인키가 없으면 `make_appcast.sh`가 서명 단계에서 멈춥니다.
+- `xcrun notarytool store-credentials`로 등록한 공증 프로필 이름(`NOTARY_PROFILE`).
+
+```sh
+# 입력만 점검(빌드·공증 없음)
+CODESIGN_IDENTITY="Developer ID Application: ..." NOTARY_PROFILE="프로필이름" ./package_update.sh --check
+
+# 빌드 → 앱 공증 → DMG 서명·공증 → 최종 DMG 기준 appcast 서명·검증을 한 번에
+CODESIGN_IDENTITY="Developer ID Application: ..." NOTARY_PROFILE="프로필이름" ./package_update.sh
+```
+
+- `package_update.sh`는 `APP_VERSION`(생략 시 `build_app.sh` 기본값)·`BUILD_NUMBER`(생략 시 현재 시각, 기존 빌드·appcast보다 커야 함)를 쓰며 `dist/NasFinder-Super-Thumbnail-<버전>.dmg`와 `dist/nasfinder-super-thumbnail.xml`을 만듭니다. 업로드·게시는 하지 않습니다.
+- `build_app.sh`는 `SIGN_IDENTITY` 또는 `CODESIGN_IDENTITY`가 있을 때만 hardened runtime + 보안 타임스탬프로 서명하며, 없으면 기존처럼 ad-hoc 로컬 빌드입니다.
+- `make_appcast.sh`는 DMG 안 앱의 버전·`SUPublicEDKey`가 공개키 파일과 같은지 확인하고, 기존 항목을 보존한 채 새 항목을 추가한 뒤, 서명이 공개키로 검증될 때만 `dist/`에 반영합니다.
+- 게시 순서: ① GitHub 릴리스 `v<버전>`에 DMG와 `release.json` 업로드 → ② appcast를 `SUFeedURL`(`https://nasfinder.com/appcasts/nasfinder-super-thumbnail.xml`) 위치에 게시. 이 순서를 지켜야 appcast가 아직 없는 파일을 가리키지 않습니다.
+- 기존 `make_dmg.sh`는 구버전 기본값이 남은 단독 도구이며 업데이트 배포에는 `package_update.sh`를 사용합니다.

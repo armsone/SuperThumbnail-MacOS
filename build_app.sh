@@ -7,9 +7,48 @@ legacy_build_root="${package_root}/.build-release"
 output_app="${1:-${package_root}/dist/NasFinder Super Thumbnail.app}"
 icon_source="${package_root}/Resources/AppIcon-1024.png"
 current_stamp="$(date +%Y%m%d%H%M)"
-app_version="${APP_VERSION:-2.7.3}"
+app_version="${APP_VERSION:-2.7.16}"
 build_number="${BUILD_NUMBER:-${current_stamp}}"
 build_stamp="${DISPLAY_BUILD_NUMBER:-${current_stamp}}"
+
+# 서명 신원: SIGN_IDENTITY(기존) 또는 CODESIGN_IDENTITY. 둘 다 없거나 "-"이면 ad-hoc 로컬 빌드다.
+sign_identity="${SIGN_IDENTITY:-${CODESIGN_IDENTITY:-}}"
+if [[ "${sign_identity}" == "-" ]]; then
+  sign_identity=""
+fi
+
+# 번들 런타임(ffmpeg/ffprobe/python3)은 두 아키텍처 모두 있어야 한다. 비싼 Swift 빌드 전에 먼저 확인한다.
+runtime_source="${package_root}/Resources/Runtime"
+runtime_problems=()
+for runtime_arch in arm64 x86_64; do
+  for runtime_rel in bin/ffmpeg bin/ffprobe python/bin/python3; do
+    runtime_file="${runtime_source}/${runtime_arch}/${runtime_rel}"
+    if [[ ! -f "${runtime_file}" || ! -x "${runtime_file}" ]]; then
+      runtime_problems+=("없음 또는 실행 불가: Resources/Runtime/${runtime_arch}/${runtime_rel}")
+      continue
+    fi
+    runtime_archs="$(/usr/bin/lipo -archs "${runtime_file}" 2>/dev/null || true)"
+    if [[ " ${runtime_archs} " != *" ${runtime_arch} "* ]]; then
+      runtime_problems+=("아키텍처 불일치(${runtime_archs:-Mach-O 아님}): Resources/Runtime/${runtime_arch}/${runtime_rel}")
+    fi
+  done
+done
+if [[ -d "${runtime_source}" ]]; then
+  runtime_real="${runtime_source:A}"
+  while IFS= read -r -d '' runtime_link; do
+    runtime_target="${runtime_link:A}"
+    if [[ ! -e "${runtime_target}" || "${runtime_target}" != "${runtime_real}/"* ]]; then
+      runtime_problems+=("런타임 밖을 가리키거나 끊어진 심볼릭 링크: ${runtime_link#${package_root}/}")
+    fi
+  done < <(/usr/bin/find "${runtime_source}" -type l -print0)
+fi
+if (( ${#runtime_problems[@]} > 0 )); then
+  print -u2 "번들 런타임이 준비되지 않아 빌드를 중단합니다:"
+  for runtime_problem in "${runtime_problems[@]}"; do
+    print -u2 "  - ${runtime_problem}"
+  done
+  exit 5
+fi
 
 mkdir -p "${build_root}"
 if [[ -d "${legacy_build_root}" ]]; then
@@ -117,6 +156,13 @@ else
   print "참고: Resources/ConversionEngine (engine_cli.py, worker.py) 디렉토리가 아직 없어 번들에 포함하지 않습니다. (새 helper 모드에서 엔진 미포함으로 표시됩니다)"
 fi
 
+# 번들 런타임: 심볼릭 링크는 그대로 보존(외부로 따라가지 않음)하고 Python 캐시는 제외한다.
+print "번들 런타임 (ffmpeg/ffprobe/python3) 복사 중: ${runtime_source}"
+mkdir -p "${output_app}/Contents/Resources/Runtime"
+/usr/bin/rsync -a \
+  --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.DS_Store' \
+  "${runtime_source}/" "${output_app}/Contents/Resources/Runtime/"
+
 # SwiftPM 실행 파일의 기본 rpath는 ../lib이므로 앱 번들에 넣은 Frameworks도 명시한다.
 install_name_tool -add_rpath '@executable_path/../Frameworks' \
   "${output_app}/Contents/MacOS/NasFinderSuperThumbnailMac"
@@ -160,7 +206,7 @@ fi
 
 if [[ -n "${sparkle_public_key}" ]]; then
   plutil -insert SUPublicEDKey -string "${sparkle_public_key}" "${info_plist}"
-elif [[ -n "${SIGN_IDENTITY:-}" ]]; then
+elif [[ -n "${sign_identity}" ]]; then
   print -u2 "Sparkle 공개키가 없어 Developer ID 배포 빌드를 중단합니다."
   print -u2 "Sparkle/sparkle_ed_public_key.txt를 추가하거나 SPARKLE_PUBLIC_KEY를 지정하세요."
   exit 4
@@ -170,12 +216,27 @@ fi
 
 codesign_target() {
   local target="$1"
-  if [[ -n "${SIGN_IDENTITY:-}" ]]; then
-    codesign --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" "${target}"
+  if [[ -n "${sign_identity}" ]]; then
+    codesign --force --options runtime --timestamp --sign "${sign_identity}" "${target}"
   else
     codesign --force --sign - "${target}"
   fi
 }
+
+# 번들 런타임 안의 모든 Mach-O(실행 파일, dylib, Python lib-dynload의 .so)를 바깥 앱보다 먼저 개별 서명한다.
+# 파일 내용·rpath·디렉터리 구조는 바꾸지 않고, 심볼릭 링크(-type f 제외)는 따라가지 않는다.
+runtime_signed=0
+while IFS= read -r -d '' runtime_candidate; do
+  if [[ "$(/usr/bin/file -b "${runtime_candidate}")" == *Mach-O* ]]; then
+    codesign_target "${runtime_candidate}"
+    runtime_signed=$((runtime_signed + 1))
+  fi
+done < <(/usr/bin/find "${output_app}/Contents/Resources/Runtime" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0)
+print "번들 런타임 Mach-O ${runtime_signed}개 서명 완료"
+if (( runtime_signed == 0 )); then
+  print -u2 "번들 런타임에서 서명할 Mach-O를 찾지 못했습니다."
+  exit 6
+fi
 
 # Sparkle 프레임워크 내부의 헬퍼(XPC 서비스, Autoupdate, Updater.app)는
 # 바깥쪽 프레임워크/앱보다 먼저 개별 서명해야 한다.
@@ -197,3 +258,10 @@ print "=== 최종 번들 엔진 sha256 ==="
 /usr/bin/shasum -a 256 \
   "${output_app}/Contents/Resources/ConversionEngine/engine_cli.py" \
   "${output_app}/Contents/Resources/ConversionEngine/worker.py"
+
+print "=== 최종 번들 런타임 sha256 ==="
+/usr/bin/shasum -a 256 \
+  "${output_app}/Contents/Resources/Runtime/arm64/bin/ffmpeg" \
+  "${output_app}/Contents/Resources/Runtime/arm64/bin/ffprobe" \
+  "${output_app}/Contents/Resources/Runtime/x86_64/bin/ffmpeg" \
+  "${output_app}/Contents/Resources/Runtime/x86_64/bin/ffprobe"

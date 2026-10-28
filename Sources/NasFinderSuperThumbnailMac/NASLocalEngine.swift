@@ -1,16 +1,70 @@
 import CryptoKit
+import Darwin
 import Foundation
 
+/// Removes absolute user locations from diagnostic text that the user may paste into a chat.
+enum NASDiagnosticRedaction {
+    static func redact(_ text: String) -> String {
+        var result = text
+        let home = NSHomeDirectory()
+        if home.count > 1 {
+            result = result.replacingOccurrences(of: home, with: "~")
+        }
+        let rules: [(pattern: String, template: String)] = [
+            ("/Users/[^/\\s\"']+", "/Users/<사용자>"),
+            ("/Volumes/[^/\\s\"']+", "/Volumes/<볼륨>"),
+            ("/(private/)?var/folders/[^/\\s\"']+/[^/\\s\"']+/[^/\\s\"']+", "<임시폴더>")
+        ]
+        for rule in rules {
+            guard let regex = try? NSRegularExpression(pattern: rule.pattern) else { continue }
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: rule.template
+            )
+        }
+        return result
+    }
+
+    /// Hardware architecture the process really runs on (`arm64` / `x86_64`).
+    static var machineArchitecture: String {
+        var info = utsname()
+        uname(&info)
+        return withUnsafeBytes(of: &info.machine) { raw in
+            raw.bindMemory(to: CChar.self).baseAddress.map { String(cString: $0) } ?? "unknown"
+        }
+    }
+}
+
 /// Detection and validation of required local tool binaries and embedded scripts.
-/// Searches Apple Silicon `/opt/homebrew/bin` first, Intel `/usr/local/bin` second, and `/usr/bin` as fallback.
+/// The runtime bundled in the app (`Resources/Runtime/<arch>`) is used first; the Homebrew/system directories
+/// (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`) are only a development fallback.
 /// Fixed trusted tools rule: `ffmpeg` and `ffprobe` must both reside in the exact same directory.
 struct NASToolEnvironment: Equatable, Sendable {
+    enum RuntimeSource: String, Equatable, Sendable {
+        case bundled = "앱 내장 런타임"
+        case system = "시스템 폴더(개발용)"
+        case none = "찾지 못함"
+    }
+
     let python3URL: URL?
     let ffmpegURL: URL?
     let ffprobeURL: URL?
     let toolsDirURL: URL?
     let engineScriptURL: URL?
     let engineWorkerURL: URL?
+    var runtimeSource: RuntimeSource = .none
+
+    /// Architecture folder name of the bundled runtime that matches this build.
+    static var compiledArchitecture: String {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x86_64"
+        #else
+        return "unknown"
+        #endif
+    }
 
     var hasRequiredMediaTools: Bool {
         python3URL != nil && ffmpegURL != nil && ffprobeURL != nil && toolsDirURL != nil
@@ -32,7 +86,7 @@ struct NASToolEnvironment: Equatable, Sendable {
             if ffmpegURL == nil || ffprobeURL == nil || toolsDirURL == nil {
                 missing.append("ffmpeg/ffprobe(동일 디렉토리)")
             }
-            return "\(missing.joined(separator: ", "))를 찾을 수 없습니다. Homebrew(/opt/homebrew/bin) 또는 /usr/local/bin 설치가 필요합니다."
+            return "앱에 포함된 영상 변환 도구(\(missing.joined(separator: ", ")))를 찾을 수 없습니다. 앱 설치가 불완전하거나 손상되었을 수 있으니 최신 버전 앱을 다시 설치해 주세요. 계속되면 변환 기록의 '진단 내용 복사'로 전달해 주세요."
         }
         if !hasBundledEngine {
             return "변환 엔진(engine_cli.py, worker.py)이 앱 번들에 준비되지 않았습니다. 앱 번들에 엔진 스크립트를 포함해 주세요."
@@ -40,8 +94,41 @@ struct NASToolEnvironment: Equatable, Sendable {
         return "로컬 변환 도구 및 번들 엔진 준비 완료"
     }
 
-    /// Detects tools in standard system and Homebrew locations and verifies trusted bundle scripts.
+    /// One line per required executable (location or missing flag) for the pasteable diagnostics text.
+    var diagnosticReportLines: [String] {
+        func line(_ label: String, _ url: URL?) -> String {
+            guard let url else { return "\(label): 누락" }
+            return "\(label): \(NASDiagnosticRedaction.redact(url.path))"
+        }
+        return [
+            "도구 출처: \(runtimeSource.rawValue) (빌드 아키텍처 \(Self.compiledArchitecture))",
+            line("python3", python3URL),
+            line("ffmpeg", ffmpegURL),
+            line("ffprobe", ffprobeURL),
+            line("도구 폴더", toolsDirURL),
+            line("engine_cli.py", engineScriptURL),
+            line("worker.py", engineWorkerURL),
+            "변환 도구 준비: \(hasRequiredMediaTools ? "예" : "아니오") · 엔진 스크립트 준비: \(hasBundledEngine ? "예" : "아니오")"
+        ]
+    }
+
+    /// Detects the bundled runtime first, then (development only) standard system locations,
+    /// and verifies trusted bundle scripts.
     static func detect(bundle: Bundle = .main) -> NASToolEnvironment {
+        let (engineScript, engineWorker) = findBundledEngineScripts(in: bundle)
+
+        if let runtime = findBundledRuntime(in: bundle) {
+            return NASToolEnvironment(
+                python3URL: runtime.python3,
+                ffmpegURL: runtime.ffmpeg,
+                ffprobeURL: runtime.ffprobe,
+                toolsDirURL: runtime.binDir,
+                engineScriptURL: engineScript,
+                engineWorkerURL: engineWorker,
+                runtimeSource: .bundled
+            )
+        }
+
         let toolSearchDirs = [
             "/opt/homebrew/bin", // Apple Silicon Homebrew
             "/usr/local/bin"     // Intel Homebrew / local tools
@@ -74,16 +161,36 @@ struct NASToolEnvironment: Equatable, Sendable {
             }
         }
 
-        let (engineScript, engineWorker) = findBundledEngineScripts(in: bundle)
-
         return NASToolEnvironment(
             python3URL: python3,
             ffmpegURL: ffmpeg,
             ffprobeURL: ffprobe,
             toolsDirURL: toolsDir,
             engineScriptURL: engineScript,
-            engineWorkerURL: engineWorker
+            engineWorkerURL: engineWorker,
+            runtimeSource: (python3 != nil || ffmpeg != nil) ? .system : .none
         )
+    }
+
+    /// `Resources/Runtime/<compiled arch>/{bin/ffmpeg, bin/ffprobe, python/bin/python3}` under the absolute bundle
+    /// resource root; all three must be executable, otherwise the bundled runtime counts as absent.
+    private static func findBundledRuntime(in bundle: Bundle) -> (python3: URL, ffmpeg: URL, ffprobe: URL, binDir: URL)? {
+        guard let resourceURL = bundle.resourceURL?.standardizedFileURL, resourceURL.path.hasPrefix("/") else { return nil }
+        let root = resourceURL
+            .appendingPathComponent("Runtime", isDirectory: true)
+            .appendingPathComponent(compiledArchitecture, isDirectory: true)
+        let binDir = root.appendingPathComponent("bin", isDirectory: true)
+        let ffmpeg = binDir.appendingPathComponent("ffmpeg", isDirectory: false)
+        let ffprobe = binDir.appendingPathComponent("ffprobe", isDirectory: false)
+        let python3 = root
+            .appendingPathComponent("python", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("python3", isDirectory: false)
+        let fileManager = FileManager.default
+        guard fileManager.isExecutableFile(atPath: ffmpeg.path),
+              fileManager.isExecutableFile(atPath: ffprobe.path),
+              fileManager.isExecutableFile(atPath: python3.path) else { return nil }
+        return (python3, ffmpeg, ffprobe, binDir)
     }
 
     private static func findExecutable(named name: String, in directories: [String]) -> URL? {
@@ -162,6 +269,9 @@ struct NASEngineResultLine: Codable, Sendable {
     let output: OutputSummary?
     let candidate: CandidateSummary?
     let timeline: String?
+    /// Structured flag from `encode-local`: true when the MP4 was built on a repaired video clock, so the original must be
+    /// kept. Callers delete the original only when this is explicitly `false` (absent = keep).
+    let retain_original: Bool?
 
     struct FileSummary: Codable, Sendable {
         let size: Int64
@@ -261,7 +371,8 @@ final class NASBoundedProcessRunner: @unchecked Sendable {
     ) async throws -> NASEngineResultLine {
         try Task.checkCancellation()
 
-        var arguments = ["-I", engineScriptURL.path, operation, "--request", requestFileURL.path]
+        // Keep the signed app bundle read-only when Python imports its bundled modules.
+        var arguments = ["-I", "-B", engineScriptURL.path, operation, "--request", requestFileURL.path]
         if let toolsDirURL {
             arguments.append(contentsOf: ["--tools-dir", toolsDirURL.path])
         }
@@ -512,6 +623,7 @@ protocol NASConversionEngineBridging: Sendable {
         sourceExpectedSize: Int64,
         sourceExpectedSha256: String,
         outputRelativePath: String,
+        allowClockRecovery: Bool,
         onProgress: (@Sendable (NASEngineProgressLine) -> Void)?
     ) async throws -> NASEngineResultLine
 
@@ -542,6 +654,7 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
         sourceExpectedSize: Int64,
         sourceExpectedSha256: String,
         outputRelativePath: String,
+        allowClockRecovery: Bool = false,
         onProgress: (@Sendable (NASEngineProgressLine) -> Void)?
     ) async throws -> NASEngineResultLine {
         guard let python3 = environment.python3URL else {
@@ -562,7 +675,7 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
         // Create 0600 request file inside private 0700 workspace
         let requestFileURL = canonicalRoot.appendingPathComponent("job_\(jobID).json", isDirectory: false)
 
-        let requestDict: [String: Any] = [
+        var requestDict: [String: Any] = [
             "schema": 1,
             "operation": "encode-local",
             "job_id": jobID.lowercased(),
@@ -578,6 +691,10 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
                 "path": outputRelativePath
             ]
         ]
+
+        if allowClockRecovery {
+            requestDict["allow_clock_recovery"] = true  // sent only by the local Mac flow; absent = recovery off
+        }
 
         let requestData = try JSONSerialization.data(withJSONObject: requestDict, options: [.sortedKeys])
         guard requestData.count <= 64 * 1024 else {

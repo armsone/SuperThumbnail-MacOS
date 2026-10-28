@@ -38,6 +38,36 @@ enum LocalConversionStage: Equatable, Sendable {
         }
     }
 
+    var isFailed: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+
+    var isSkipped: Bool {
+        if case .skipped = self { return true }
+        return false
+    }
+
+    /// Short badge for list rows; the full text lives in `detailText`.
+    var shortBadge: String {
+        switch self {
+        case .completed: return "완료"
+        case .failed: return "실패"
+        case .skipped: return "건너뜀"
+        case .cancelled: return "취소됨"
+        case .pending, .preparing, .copyingSource, .converting, .verifying, .staging, .publishing: return displayName
+        }
+    }
+
+    /// Complete, unshortened reason for failed / skipped stages.
+    var detailText: String? {
+        switch self {
+        case .failed(let err): return err
+        case .skipped(let reason): return reason
+        default: return nil
+        }
+    }
+
     var displayName: String {
         switch self {
         case .pending: return "대기 중"
@@ -159,6 +189,9 @@ struct LocalAttemptContext: Sendable {
     let expectedIdentity: LocalFileIdentity
     let attemptID: String
     let engineRef: String
+    /// Set only for a candidate recovery proved to already have a verified published MP4: the worker re-verifies it
+    /// under its own new claim and only creates/verifies the thumbnail (no re-encode, no deletion).
+    var publishedResume: LocalPublishedResumeProof? = nil
 }
 
 enum LocalWorkerResult: Sendable {
@@ -166,16 +199,187 @@ enum LocalWorkerResult: Sendable {
     case failed(message: String)
     case skipped(message: String)
     case cancelled
+    /// Internal to the retry wrapper: the pre-publication attempt was aborted only because WebDAV refreshed
+    /// mtime/ctime. Never surfaced to the coordinator.
+    case identityRefresh(LocalFileIdentity)
+}
+
+/// What a finished attempt confirmed about its own cleanup; a metadata-refresh retry runs only if all are clean.
+final class LocalAttemptCleanupState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimPending = false
+    private var workspacePending = false
+
+    var isFullyCleaned: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !claimPending && !workspacePending
+    }
+
+    func setClaimPending(_ pending: Bool) {
+        lock.lock()
+        claimPending = pending
+        lock.unlock()
+    }
+
+    func setWorkspacePending(_ pending: Bool) {
+        lock.lock()
+        workspacePending = pending
+        lock.unlock()
+    }
+}
+
+/// Thrown after the copy phase when only mtime/ctime of the same WebDAV file changed.
+struct LocalIdentityRefreshRequest: Error {
+    let refreshed: LocalFileIdentity
+}
+
+/// The preclaim source `openat` kept returning EINTR: a real connection interruption, never an owner conflict.
+struct LocalSourceOpenInterruptedError: Error {
+    let fileName: String
+}
+
+/// Single-use hold of one download permit. `release` / `releaseDetached` are idempotent and only release a
+/// permit that was actually acquired, so early exits cannot leak or double-release it.
+final class DownloadPermitHold: @unchecked Sendable {
+    private let limiter: NASResourceLimiter
+    private let lock = NSLock()
+    private var held = false
+    private var detachedRelease: Task<Void, Never>?
+
+    init(limiter: NASResourceLimiter) {
+        self.limiter = limiter
+    }
+
+    func acquire() async throws {
+        try await limiter.acquire()
+        markHeld()
+    }
+
+    private func markHeld() {
+        lock.lock()
+        held = true
+        lock.unlock()
+    }
+
+    private func takeHeld() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let was = held
+        held = false
+        return was
+    }
+
+    /// Returns only after the permit is back in the limiter, also when `releaseDetached` already started returning it.
+    func release() async {
+        if takeHeld() {
+            await limiter.release()
+        }
+        let pending = lock.withLock { detachedRelease }
+        await pending?.value
+    }
+
+    /// For `defer` blocks that cannot await.
+    func releaseDetached() {
+        guard takeHeld() else { return }
+        let limiter = self.limiter
+        let task = Task { await limiter.release() }
+        lock.lock()
+        detachedRelease = task
+        lock.unlock()
+    }
 }
 
 enum LocalConversionWorker {
-    /// Nonisolated background worker performing heavy file I/O, hashing, engine execution,
-    /// and atomic descriptor-relative publication strictly off the MainActor.
+    private nonisolated static func isWebDAV(fd: Int32) -> Bool {
+        var fs = statfs()
+        guard fstatfs(fd, &fs) == 0 else { return false }
+        let name = withUnsafeBytes(of: fs.f_fstypename) { raw -> String in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return "" }
+            return String(cString: base)
+        }
+        return name == "webdav"
+    }
+
+    /// WebDAV can serve cached mtime/ctime that refresh after a read. When a pre-publication check finds ONLY that
+    /// (same dev/inode/size, full byte count), the failed attempt is cleaned up completely (claim released, fds
+    /// closed, workspace removed, download slot freed) and exactly ONE new whole attempt runs with a fresh
+    /// descriptor, attempt ID, claim, and hash, pinned to the refreshed identity. No further refresh is allowed.
     nonisolated static func performConversion(
         context: LocalAttemptContext,
         pinnedRoot: NASPinnedRoot,
         engineBridge: DefaultNASConversionEngineBridge,
         downloadLimiter: NASResourceLimiter,
+        encodeLimiter: NASResourceLimiter,
+        onProgress: @Sendable @escaping (Double?, String?) -> Void,
+        onStageChange: @Sendable @escaping (LocalConversionStage, String) -> Void
+    ) async -> LocalWorkerResult {
+        let cleanup = LocalAttemptCleanupState()
+        let firstPermit = DownloadPermitHold(limiter: downloadLimiter)
+        let first = await performSingleAttempt(
+            context: context,
+            allowIdentityRefresh: true,
+            cleanup: cleanup,
+            downloadPermit: firstPermit,
+            pinnedRoot: pinnedRoot,
+            engineBridge: engineBridge,
+            encodeLimiter: encodeLimiter,
+            onProgress: onProgress,
+            onStageChange: onStageChange
+        )
+        // The first attempt's download permit is back in the limiter before the retry asks for its own.
+        await firstPermit.release()
+        guard case .identityRefresh(let refreshed) = first else { return first }
+
+        // All defers of the first attempt have run. Without confirmed cleanup (e.g. claim not released) never retry.
+        guard cleanup.isFullyCleaned else {
+            return .skipped(message: "원본 정보 변경 감지 후 정리를 확인하지 못해 재시도하지 않습니다(원본 유지)")
+        }
+        if Task.isCancelled { return .cancelled }
+        onStageChange(.preparing, "원본 정보 새로 확인 중")
+        onProgress(nil, nil)
+
+        let newAttemptID = UUID().uuidString.lowercased()
+        let retryContext = LocalAttemptContext(
+            itemID: context.itemID,
+            folderID: context.folderID,
+            sourceURL: context.sourceURL,
+            relativePath: context.relativePath,
+            relativeComponents: context.relativeComponents,
+            fileSize: context.fileSize,
+            expectedIdentity: refreshed,
+            attemptID: newAttemptID,
+            // The first attempt never started the engine, so the coordinator's cancel handle (this ref) stays valid.
+            engineRef: context.engineRef,
+            // A resume of an already published MP4 must stay a resume (never fall into a fresh encode).
+            publishedResume: context.publishedResume
+        )
+        let second = await performSingleAttempt(
+            context: retryContext,
+            allowIdentityRefresh: false,
+            cleanup: LocalAttemptCleanupState(),
+            downloadPermit: DownloadPermitHold(limiter: downloadLimiter),
+            pinnedRoot: pinnedRoot,
+            engineBridge: engineBridge,
+            encodeLimiter: encodeLimiter,
+            onProgress: onProgress,
+            onStageChange: onStageChange
+        )
+        if case .identityRefresh = second {
+            return .skipped(message: "원본 정보가 다시 바뀌어 건너뜁니다(원본 유지)")
+        }
+        return second
+    }
+
+    /// Nonisolated background worker performing heavy file I/O, hashing, engine execution,
+    /// and atomic descriptor-relative publication strictly off the MainActor.
+    private nonisolated static func performSingleAttempt(
+        context: LocalAttemptContext,
+        allowIdentityRefresh: Bool,
+        cleanup: LocalAttemptCleanupState,
+        downloadPermit: DownloadPermitHold,
+        pinnedRoot: NASPinnedRoot,
+        engineBridge: DefaultNASConversionEngineBridge,
         encodeLimiter: NASResourceLimiter,
         onProgress: @Sendable @escaping (Double?, String?) -> Void,
         onStageChange: @Sendable @escaping (LocalConversionStage, String) -> Void
@@ -186,15 +390,32 @@ enum LocalConversionWorker {
         let attemptID = context.attemptID
         let engineRef = context.engineRef
 
-        // 1. Conservative disk capacity check (at least 2x source size + 500MB headroom)
-        let requiredSpace = fileSize * 2 + 500_000_000
-        if let available = LocalVolumeDetector.availableCapacityBytes(for: sourceURL), available < requiredSpace {
+        // 0. The download permit covers everything that touches the remote source (volume query, open, lock,
+        //    claim, workspace setup, copy). macOS WebDAV downloads eagerly on open, so opening before the permit
+        //    let several workers hammer the NAS at once. It is released before encoding starts.
+        onStageChange(.preparing, "다운로드 순서 대기 중")
+        do {
+            try await downloadPermit.acquire()
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+        // Every exit path (return, throw, cancellation) releases the permit exactly once.
+        defer { downloadPermit.releaseDetached() }
+        if Task.isCancelled { return .cancelled }
+        onStageChange(.preparing, "NAS 원본 연결 중")
+
+        // 1. Conservative disk capacity check (at least 2x source size + 500MB headroom).
+        //    A resume of an already published MP4 copies and encodes nothing, so it needs no such headroom.
+        let requiredSpace = context.publishedResume == nil ? fileSize * 2 + 500_000_000 : 0
+        if requiredSpace > 0, let available = LocalVolumeDetector.availableCapacityBytes(for: sourceURL), available < requiredSpace {
             let msg = "디스크 여유 공간 부족 (필요: \(requiredSpace / 1024 / 1024)MB, 사용 가능: \(available / 1024 / 1024)MB)"
             return .failed(message: msg)
         }
         // Download/encode cache lives in the local temporary directory regardless of remote quota reporting.
         let tempURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        if let localAvailable = LocalVolumeDetector.availableCapacityBytes(for: tempURL), localAvailable < requiredSpace {
+        if requiredSpace > 0, let localAvailable = LocalVolumeDetector.availableCapacityBytes(for: tempURL), localAvailable < requiredSpace {
             let msg = "Mac 임시 공간 부족 (필요: \(requiredSpace / 1024 / 1024)MB, 사용 가능: \(localAvailable / 1024 / 1024)MB)"
             return .failed(message: msg)
         }
@@ -220,9 +441,29 @@ enum LocalConversionWorker {
                     throw NSError(domain: "LocalConversionError", code: 41, userInfo: [NSLocalizedDescriptionKey: "상위 디렉터리가 검증된 루트 파일시스템과 일치하지 않습니다 (하위 마운트 또는 stat 실패)."])
                 }
 
-                let fd = openat(parentFD, fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                // Only this preclaim open: a network mount may interrupt it (EINTR). At most 3 retries on the same
+                // parentFD with NOFOLLOW; ENOENT and every other errno fail at once, exactly as before.
+                var fd: Int32 = -1
+                var err: Int32 = 0
+                var attempt = 0
+                while true {
+                    fd = openat(parentFD, fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                    if fd >= 0 { break }
+                    err = errno
+                    guard err == EINTR else { break }
+                    if attempt >= 3 {
+                        Darwin.close(parentFD)
+                        throw LocalSourceOpenInterruptedError(fileName: fileName)
+                    }
+                    attempt += 1
+                    do {
+                        try Task.checkCancellation()
+                    } catch {
+                        Darwin.close(parentFD)
+                        throw error
+                    }
+                }
                 guard fd >= 0 else {
-                    let err = errno
                     Darwin.close(parentFD)
                     throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "파일 열기 실패 (errno \(err)): \(fileName)"])
                 }
@@ -233,14 +474,29 @@ enum LocalConversionWorker {
                     relativeComponents: context.relativeComponents
                 )
             }
+        } catch is CancellationError {
+            return .cancelled
+        } catch is LocalSourceOpenInterruptedError {
+            return .failed(message: "NAS 연결이 중단되어 원본을 열지 못했습니다 (errno 4, 3회 재시도 후). 네트워크 연결을 확인한 뒤 다시 시도해 주세요. 원본은 변경되지 않았습니다.")
         } catch {
             return .skipped(message: "잠금 획득 불가: \(error.localizedDescription)")
         }
         defer { lock.unlock() }
 
         // Verify initial identity matches discovered identity
-        guard lock.identity == context.expectedIdentity else {
-            return .skipped(message: "파일 식별 정보가 변경되었습니다.")
+        // Exact match only (nothing tolerated or adopted); the lock identity is what claim and deletion gates later use.
+        // NO-DELETE resume of an already published MP4: the original is never changed or deleted here, and a webdav mount may show
+        // other mtime/ctime for the same file at every enumeration or open. Only dev/inode/size bind it (and the exact journal is
+        // re-proven below); no refresh retry, no skip for time-only differences. Any other difference still skips.
+        let resumeKeepsTimeChurn = context.publishedResume != nil && isWebDAV(fd: lock.fd)
+            && lock.identity.isSameFile(as: context.expectedIdentity)
+        guard lock.identity == context.expectedIdentity || resumeKeepsTimeChurn else {
+            if allowIdentityRefresh, isWebDAV(fd: lock.fd),
+               lock.identity.isTimestampOnlyDrift(from: context.expectedIdentity) {
+                return .identityRefresh(lock.identity)
+            }
+            let diff = lock.identity.differences(from: context.expectedIdentity).joined(separator: ", ")
+            return .skipped(message: "파일 식별 정보가 목록 조회 시점과 달라 건너뜁니다(원본 유지): \(diff)")
         }
 
         let stem = (fileName as NSString).deletingPathExtension
@@ -265,8 +521,49 @@ enum LocalConversionWorker {
         }
 
         var conversionSucceeded = false
+        cleanup.setClaimPending(true)
         defer {
-            _ = claim.release(success: conversionSucceeded)
+            if claim.release(success: conversionSucceeded) == nil {
+                cleanup.setClaimPending(false)
+            }
+        }
+
+        // 3b. Resume of an already published MP4 (recovery handed over the proof). The current claim is this attempt's
+        //     own; the proof is re-verified from the files under it (original identity, exact journal, MP4 size + SHA-256).
+        //     Only the thumbnail is created/verified. The original is NEVER deleted here and nothing is re-encoded,
+        //     overwritten or cleaned up; on any failure the claim is released and every file stays.
+        if let resume = context.publishedResume {
+            onStageChange(.verifying, "이전 발행 MP4 확인 중")
+            claim.updatePhase("verifying")
+            var previousMP4Verified = false
+            do {
+                let published = try LocalPublicationManager.verifyResumedPublication(
+                    sourceLock: lock, proof: resume, claim: claim
+                )
+                // The earlier MP4 is now proven under this claim: if anything fails from here on, keep this claim as recovery
+                // evidence (existing mutation-started semantics) so the next start can archive it and seed the retry again.
+                claim.markSourceMutationStarted()
+                previousMP4Verified = true
+                try Task.checkCancellation()
+                onStageChange(.publishing, "썸네일 생성 중")
+                claim.updatePhase("thumbnail")
+                let finalURL = sourceURL.deletingLastPathComponent().appendingPathComponent(published.finalFileName)
+                _ = try await LocalPublicationManager.createVerifiedThumbnail(
+                    sourceLock: lock,
+                    published: published,
+                    finalURL: finalURL,
+                    resumedPublication: true
+                )
+                conversionSucceeded = true
+                return .completed(message: "이전 변환의 MP4·썸네일 확인 완료 (원본 보존, 삭제하지 않음)")
+            } catch is CancellationError {
+                return .cancelled
+            } catch {
+                let state = previousMP4Verified
+                    ? "이전 MP4는 검증됨·현재 원본은 그대로 보존·기록 보존, 썸네일만 미완료 (다음 시작 때 이어서 시도)"
+                    : "이전 MP4·원본·기록은 그대로 보존"
+                return .failed(message: "\(error.localizedDescription) [\(state)]")
+            }
         }
 
         // 4. Prepare private owned workspace root with OS canonical realpath
@@ -280,9 +577,14 @@ enum LocalConversionWorker {
 
         let workspaceURL = canonicalTempURL.appendingPathComponent("SuperThumbnail-Local-\(attemptID)", isDirectory: true)
 
+        cleanup.setWorkspacePending(true)
         do {
             try NASPathSecurity.prepareOwnedWorkspaceRoot(at: workspaceURL)
         } catch {
+            try? FileManager.default.removeItem(at: workspaceURL)
+            if !FileManager.default.fileExists(atPath: workspaceURL.path) {
+                cleanup.setWorkspacePending(false)
+            }
             return .failed(message: "작업공간 준비 실패: \(error.localizedDescription)")
         }
 
@@ -294,6 +596,9 @@ enum LocalConversionWorker {
         defer {
             if !shouldRetainWorkspaceEvidence {
                 try? FileManager.default.removeItem(at: workspaceURL)
+                if !FileManager.default.fileExists(atPath: workspaceURL.path) {
+                    cleanup.setWorkspacePending(false)
+                }
             }
         }
 
@@ -309,7 +614,7 @@ enum LocalConversionWorker {
 
             let sourceFD = lock.fd
             let expectedIdentity = lock.identity
-            let (sourceSha256, copiedBytes) = try await downloadLimiter.withPermit { () -> (String, Int64) in
+            let (sourceSha256, copiedBytes) = try await { () async throws -> (String, Int64) in
                 onStageChange(.copyingSource, "원본 임시 복사 중")
 
                 let dupSourceFD = dup(sourceFD)
@@ -354,12 +659,20 @@ enum LocalConversionWorker {
                 // Verify identity unchanged during copy
                 let postCopyIdentity = try LocalFileIdentity.inspect(fd: sourceFD)
                 guard postCopyIdentity == expectedIdentity, copied == fileSize else {
-                    throw NSError(domain: "LocalConversionError", code: 30, userInfo: [NSLocalizedDescriptionKey: "복사 전후 원본 파일 식별 정보 불일치"])
+                    if allowIdentityRefresh, copied == fileSize, isWebDAV(fd: sourceFD),
+                       postCopyIdentity.isTimestampOnlyDrift(from: expectedIdentity) {
+                        throw LocalIdentityRefreshRequest(refreshed: postCopyIdentity)
+                    }
+                    var detail = postCopyIdentity.differences(from: expectedIdentity)
+                    if copied != fileSize { detail.append("복사 바이트(\(copied)≠목록 크기 \(fileSize))") }
+                    throw NSError(domain: "LocalConversionError", code: 30, userInfo: [NSLocalizedDescriptionKey: "복사 전후 원본 파일 식별 정보 불일치(원본 유지): \(detail.joined(separator: ", "))"])
                 }
 
                 onProgress(1, "다운로드 완료 · 인코딩 대기")
                 return (sha, copied)
-            }
+            }()
+            // Copy finished: free the download slot so the next file can start while this one encodes.
+            await downloadPermit.release()
             claim.updatePhase("copyingSource")
 
             // 6. Invoke ConversionEngine via engineBridge.encodeLocal
@@ -383,6 +696,7 @@ enum LocalConversionWorker {
                     sourceExpectedSize: copiedBytes,
                     sourceExpectedSha256: sourceSha256,
                     outputRelativePath: outputRelative,
+                    allowClockRecovery: true,
                     onProgress: { prog in
                         let pct = prog.phase_pct
                         let label = prog.phase_label ?? prog.phase
@@ -454,6 +768,13 @@ enum LocalConversionWorker {
                 finalURL: finalURL
             )
 
+            // 11b. Repaired-clock output: MP4 and thumbnail are verified and published, but the original is KEPT.
+            //      Decided only by the engine's structured flag (deleted only when it is explicitly false), never by message text.
+            if engineResult.retain_original != false {
+                conversionSucceeded = true
+                return .completed(message: "복구 변환 완료 (원본 보존)")
+            }
+
             // 12. Delete ONLY this attempt's pinned original once MP4 and thumbnail are both verified.
             onStageChange(.publishing, "원본 정리 중")
             claim.updatePhase("deleting")
@@ -475,6 +796,8 @@ enum LocalConversionWorker {
             conversionSucceeded = true
             return .completed(message: "변환 완료 (MP4·썸네일 확인 후 원본 정리됨)")
 
+        } catch let refresh as LocalIdentityRefreshRequest {
+            return .identityRefresh(refresh.refreshed)
         } catch is CancellationError {
             engineBridge.cancel(ref: engineRef)
             if outputPublished {
@@ -524,13 +847,24 @@ final class LocalConversionCoordinator: ObservableObject {
     @Published private(set) var statusMessage: String = "대기 중"
     @Published private(set) var activeAttemptCount: Int = 0
     @Published private(set) var recoveryNotice: String? = nil
+    @Published private(set) var isRecovering: Bool = false
+    /// Per-item reasons and real folder I/O errors of the last cleanup/retry; stays visible until the next run.
+    @Published private(set) var recoveryDetails: [String] = []
+    /// Sticky notice about reading the saved history file (corrupt / unreadable / rejected records).
+    @Published private(set) var historyLoadNotice: String? = nil
+    /// Latest failure while saving the history file; cleared by the next successful save.
+    @Published private(set) var historySaveNotice: String? = nil
+
+    /// Set by the view: true while the NAS helper is working, so cleanup/retry never overlaps it.
+    var isExternalWorkActive: (() -> Bool)?
 
     var hasActiveWork: Bool {
-        isRunning || isPaused || !activeItems.isEmpty || !activeTasks.isEmpty || inFlightPulls > 0 || !pendingCandidates.isEmpty
+        isRunning || isPaused || isSearching || !activeItems.isEmpty || !activeTasks.isEmpty || inFlightPulls > 0 || !pendingCandidates.isEmpty || isRecovering
     }
 
     /// A final denominator is available only after every selected direct folder was fully read.
     var knownTotalCount: Int? {
+        if isTargetedRetry { return targetedTotal }
         let ready = folders.filter { $0.status.isReady }
         guard !ready.isEmpty, inFlightPulls == 0, pendingCandidates.isEmpty,
               ready.allSatisfy({ folder in
@@ -558,6 +892,9 @@ final class LocalConversionCoordinator: ObservableObject {
     private var pendingCandidates: [LocalDiscoveredFile] = []
     private var currentRunGeneration: Int = 0
     private var failedIdentitiesInPass: Set<LocalFileIdentity> = []
+    /// Finite retry of an explicit candidate list: never pulls from folder cursors.
+    private var isTargetedRetry = false
+    private var targetedTotal = 0
 
     private static let maxRecentHistoryCount = 100
 
@@ -575,6 +912,12 @@ final class LocalConversionCoordinator: ObservableObject {
             self.maxConcurrentConversions = LocalConversionConstants.defaultConcurrency
         }
         self.encodeLimiter = NASResourceLimiter(capacity: initialConcurrency)
+
+        LocalConversionHistoryStore.shared.load { [weak self] outcome in
+            Task { @MainActor [weak self] in
+                self?.applyLoadedHistory(outcome)
+            }
+        }
 
         loadRememberedFolders()
     }
@@ -704,6 +1047,10 @@ final class LocalConversionCoordinator: ObservableObject {
     }
 
     func removeFolder(id: UUID) {
+        guard !isRecovering else {
+            statusMessage = "정리·다시 시도 중에는 폴더를 제거할 수 없습니다. 끝난 뒤 다시 시도해 주세요."
+            return
+        }
         guard let index = folders.firstIndex(where: { $0.id == id }) else { return }
         let item = folders.remove(at: index)
 
@@ -745,6 +1092,10 @@ final class LocalConversionCoordinator: ObservableObject {
     }
 
     func refreshFolders() {
+        guard !isRecovering else {
+            statusMessage = "정리·다시 시도 중에는 새로고침할 수 없습니다."
+            return
+        }
         for folder in folders {
             folderCursors[folder.id]?.reset()
             if folder.status.isReady, folderPins[folder.id] == nil {
@@ -765,21 +1116,17 @@ final class LocalConversionCoordinator: ObservableObject {
             }
             return
         }
-
-        currentRunGeneration += 1
-        pendingCandidates.removeAll()
-
-        // Reset cursors and pass-local tracking for fresh pass
-        failedIdentitiesInPass.removeAll()
-        for cursor in folderCursors.values {
-            cursor.reset()
+        guard !isRecovering else {
+            statusMessage = "준비 중입니다. 잠시 후 다시 시작할 수 있습니다."
+            return
+        }
+        guard !hasActiveWork else {
+            statusMessage = "진행 중인 작업이 있어 새로 시작하지 않았습니다."
+            return
         }
 
-        counters = LocalConversionCounters()
-        isRunning = true
-        isPaused = false
-        statusMessage = "영상 변환 시작"
-        scheduleWork()
+        // Single entry point: safe cleanup of own interrupted markers, then a full scan of all remaining originals.
+        recoverAndRetry(includeAllRemaining: true)
     }
 
     func pause() {
@@ -802,6 +1149,8 @@ final class LocalConversionCoordinator: ObservableObject {
         onDirectWorkCompleted = nil
         currentRunGeneration += 1
         pendingCandidates.removeAll()
+        isTargetedRetry = false
+        targetedTotal = 0
         inFlightPulls = 0
         isRunning = false
         isPaused = false
@@ -824,7 +1173,296 @@ final class LocalConversionCoordinator: ObservableObject {
 
     func clearHistory() {
         recentItems.removeAll { $0.stage.isTerminal && self.activeTasks[$0.id] == nil }
+        LocalConversionHistoryStore.shared.clear { [weak self] failure in
+            Task { @MainActor [weak self] in
+                self?.historySaveNotice = failure
+            }
+        }
         updateQueueSummary()
+    }
+
+    private func applyLoadedHistory(_ outcome: LocalHistoryLoadOutcome) {
+        historyLoadNotice = outcome.notice
+        let knownIDs = Set(recentItems.map(\.id))
+        let older = outcome.items.filter { !knownIDs.contains($0.id) }
+        guard !older.isEmpty else { return }
+        recentItems = (recentItems + older).sorted { $0.addedDate > $1.addedDate }
+        pruneRecentItems()
+    }
+
+    private func persistIfTerminal(_ item: LocalConversionItem) {
+        guard item.stage.isTerminal else { return }
+        LocalConversionHistoryStore.shared.upsert([item]) { [weak self] failure in
+            Task { @MainActor [weak self] in
+                self?.historySaveNotice = failure
+            }
+        }
+    }
+
+    // MARK: - Recovery & Retry Operations
+
+    /// Latest terminal history record of one file, expressed in the CURRENTLY selected folders.
+    struct HistoryLocation: Sendable {
+        let target: LocalRetryTarget
+        let stage: LocalConversionStage
+        let addedDate: Date
+    }
+
+    /// Re-expresses a persisted record in the currently selected folders (e.g. after the selected root moved from
+    /// `.../01-CLIP` up to `.../Caution`). The recorded absolute location must lie strictly INSIDE a selected root
+    /// (whole path components, never a string prefix; the most specific selected root wins; the stored folder ID is never
+    /// trusted on its own). The derived components are re-validated; anything outside, or whose file name differs from the
+    /// recorded one, is rejected. Symlinks are not followed later: the pinned no-follow walk stays authoritative.
+    nonisolated static func currentLocation(of item: LocalConversionItem, in folders: [LocalFolderItem]) -> LocalRetryTarget? {
+        let recorded = item.sourceURL.standardizedFileURL.pathComponents
+        var best: (folder: LocalFolderItem, depth: Int)?
+        for folder in folders {
+            let root = folder.url.standardizedFileURL.pathComponents
+            guard recorded.count > root.count, Array(recorded.prefix(root.count)) == root else { continue }
+            if let current = best, current.depth > root.count || (current.depth == root.count && current.folder.id == item.folderID) { continue }
+            best = (folder, root.count)
+        }
+        guard let best else { return nil }
+
+        var derived = Array(recorded.dropFirst(best.depth))
+        let recordedTail = item.relativeComponents
+        if derived.count >= recordedTail.count, Array(derived.suffix(recordedTail.count)) == recordedTail {
+            derived = Array(derived.dropLast(recordedTail.count)) + recordedTail   // keep the exact enumerated names
+        }
+        guard derived.last == recordedTail.last,
+              let validated = LocalConversionRetryInspector.validatedComponents(derived) else { return nil }
+        return LocalRetryTarget(folderID: best.folder.id, components: validated)
+    }
+
+    /// Latest terminal record per FILE in the current folders (records of removed/moved roots merge with newer ones for the
+    /// same absolute file, so a newer completion always wins over an older failure). Oldest first.
+    nonisolated static func latestHistoryLocations(from items: [LocalConversionItem], folders: [LocalFolderItem]) -> [HistoryLocation] {
+        var latest: [String: (location: HistoryLocation, order: Int)] = [:]
+        for (order, item) in items.enumerated() where item.stage.isTerminal {
+            guard let target = currentLocation(of: item, in: folders) else { continue }
+            let key = "\(target.folderID.uuidString)/\(target.components.joined(separator: "/"))"
+            if let existing = latest[key], existing.location.addedDate >= item.addedDate { continue }
+            latest[key] = (HistoryLocation(target: target, stage: item.stage, addedDate: item.addedDate), order)
+        }
+        return latest.values
+            .sorted { ($0.location.addedDate, $0.order) < ($1.location.addedDate, $1.order) }
+            .map(\.location)
+    }
+
+    /// Only a latest failed/skipped record is retried (completed history stays ignored).
+    nonisolated static func retryTargets(from locations: [HistoryLocation]) -> [LocalRetryTarget] {
+        locations.filter { $0.stage.isFailed || $0.stage.isSkipped }.map(\.target)
+    }
+
+    /// Unique parent directories of every known not-completed file (failed/skipped/cancelled) plus each selected root.
+    /// Used by the unified start to recover this Mac's own claims WITHOUT walking the whole tree first.
+    nonisolated static func recoveryDirectories(from locations: [HistoryLocation], folders: [LocalFolderItem]) -> [UUID: Set<[String]>] {
+        var out: [UUID: Set<[String]>] = [:]
+        for folder in folders { out[folder.id, default: []].insert([]) }
+        for location in locations {
+            if case .completed = location.stage { continue }
+            out[location.target.folderID, default: []].insert(Array(location.target.components.dropLast()))
+        }
+        return out
+    }
+
+    /// Checks the conversion tools once before any cleanup, claim or download. When they are missing the whole run is
+    /// refused with ONE app-level status: no per-file failure records and no source access.
+    private func preflightConversionTools() -> Bool {
+        let environment = NASToolEnvironment.detect()
+        guard environment.isReadyToExecute else {
+            let message = "변환을 시작하지 못했습니다. \(environment.diagnosticMessage)"
+            onDirectWorkCompleted = nil
+            isRecovering = false
+            recoveryNotice = message
+            statusMessage = message
+            return false
+        }
+        return true
+    }
+
+    /// Safe cleanup of this Mac's own interrupted work markers (off the main thread, under the exclusive device
+    /// lease), then a finite retry of failed/skipped files. Without any failed/skipped history (e.g. first start after
+    /// an upgrade) every remaining eligible original in the selected folders is searched again.
+    func recoverAndRetry(includeAllRemaining: Bool = false) {
+        guard !hasActiveWork else {
+            statusMessage = "진행 중인 작업이 있어 정리·다시 시도를 시작하지 않았습니다."
+            return
+        }
+        if isExternalWorkActive?() == true {
+            statusMessage = "이 앱에서 다른 변환이 진행 중이라 정리·다시 시도를 시작하지 않았습니다."
+            return
+        }
+        let readyFolders = folders.filter { $0.status.isReady }
+        guard !readyFolders.isEmpty else {
+            statusMessage = "작업 가능한 폴더가 없습니다."
+            return
+        }
+        guard preflightConversionTools() else { return }
+
+        // Pinned roots are duplicated now and kept for the WHOLE operation (cleanup and fresh inspection).
+        var pins: [UUID: NASPinnedRoot] = [:]
+        var pinErrors: [String] = []
+        for folder in readyFolders {
+            if let pin = folderPins[folder.id]?.duplicate() {
+                pins[folder.id] = pin
+            } else {
+                pinErrors.append("[폴더 오류] \(folder.displayName): 폴더 연결을 열지 못했습니다. 폴더 상태를 확인한 뒤 새로고침해 주세요.")
+            }
+        }
+        guard pinErrors.isEmpty else {
+            for pin in pins.values { pin.close() }
+            recoveryDetails = pinErrors
+            let message = "폴더 접근 오류로 정리·다시 시도를 시작하지 않았습니다 (\(pinErrors.count)개 폴더)."
+            recoveryNotice = message
+            statusMessage = message
+            return
+        }
+
+        let finalPins = pins
+        let historySnapshot = recentItems
+        let locations = Self.latestHistoryLocations(from: historySnapshot, folders: readyFolders)
+        let targets = includeAllRemaining ? [] : Self.retryTargets(from: locations)
+        let hasRetryHistory = !targets.isEmpty
+        // Latest failed/skipped files that may already own a published MP4 (checked candidate-locally, read-only and without reading
+        // the MP4 content; the worker proves the full SHA-256 before any thumbnail write). The regular scan is unchanged.
+        let resumeTargets = Self.retryTargets(from: locations)
+        // Unified start recovers own claims only in known directories (history parents + selected roots), never the whole tree
+        // before the first encode. Unknown stale claims elsewhere are skipped untouched by discovery (no claim is taken over);
+        // once such a file shows up in history (skipped), the next start recovers it. The manual retry keeps the full scan.
+        let recoveryScope: [UUID: Set<[String]>]? = includeAllRemaining ? Self.recoveryDirectories(from: locations, folders: readyFolders) : nil
+
+        isRecovering = true
+        recoveryNotice = nil
+        recoveryDetails = []
+        statusMessage = includeAllRemaining ? "준비 중: 중단된 작업 표시 정리 중..." : "중단된 작업 표시 정리 중..."
+
+        Task { [weak self] in
+            let recovery = await LocalConversionRecovery.performRecovery(folders: readyFolders, pins: finalPins, onlyDirectories: recoveryScope)
+
+            var inspection = LocalRetryInspection()
+            if hasRetryHistory, recovery.blockedReason == nil {
+                inspection = await Task.detached(priority: .userInitiated) {
+                    LocalConversionRetryInspector.inspect(targets: targets, folders: readyFolders, pins: finalPins)
+                }.value
+            }
+            if !resumeTargets.isEmpty, recovery.blockedReason == nil {
+                let known = await Task.detached(priority: .userInitiated) {
+                    LocalConversionRecovery.inspectKnownPublishedResume(targets: resumeTargets, folders: readyFolders, pins: finalPins)
+                }.value
+                inspection.candidates += known.candidates
+                inspection.errors += known.errors
+                inspection.notes += known.notes
+            }
+            for pin in finalPins.values { pin.close() }
+
+            guard let self else { return }
+            self.finishRecovery(recovery: recovery, inspection: inspection, hasRetryHistory: hasRetryHistory, unifiedStart: includeAllRemaining)
+        }
+    }
+
+    private func finishRecovery(
+        recovery: LocalConversionRecoveryResult,
+        inspection: LocalRetryInspection,
+        hasRetryHistory: Bool,
+        unifiedStart: Bool = false
+    ) {
+        recoveryDetails = recovery.detailLines + inspection.errors.map { "[폴더 오류] \($0)" } + inspection.notes.map { "[건너뜀] \($0)" }
+        let summary = recovery.summaryMessage
+        let errorSuffix = inspection.errors.isEmpty ? "" : " · 다시 시도 대상 확인 오류 \(inspection.errors.count)건"
+
+        guard recovery.blockedReason == nil else {
+            isRecovering = false
+            recoveryNotice = summary
+            statusMessage = summary
+            return
+        }
+
+        if !hasRetryHistory {
+            // No failed/skipped history: search ALL remaining eligible originals (recovered files are found again by this scan).
+            // Published MP4s are skipped by discovery (the MP4 exists), so recovery's resume candidates are queued explicitly.
+            var seenResume = Set<String>()
+            let resumeCandidates = (recovery.recoveredCandidates.filter { $0.publishedResume != nil } + inspection.candidates).filter {
+                seenResume.insert("\($0.folderID.uuidString)/\($0.relativeComponents.joined(separator: "/"))").inserted
+            }
+            let resumeNote = resumeCandidates.isEmpty ? "" : " 발행된 MP4 \(resumeCandidates.count)개는 썸네일 확인만 이어서 진행합니다."
+            let message = unifiedStart
+                ? "\(summary) · 남은 원본 전체를 찾아 변환합니다.\(resumeNote)"
+                : "\(summary) · 실패 기록이 없어 남은 원본 전체를 다시 찾아 변환합니다.\(resumeNote)"
+            recoveryNotice = message
+            isRecovering = false
+            beginFullRescan(message: "남은 원본 영상 전체 탐색 및 변환 시작", seed: resumeCandidates)
+            return
+        }
+
+        var seen = Set<String>()
+        var candidates: [LocalDiscoveredFile] = []
+        for candidate in recovery.recoveredCandidates + inspection.candidates {
+            let key = "\(candidate.folderID.uuidString)/\(candidate.relativeComponents.joined(separator: "/"))"
+            if seen.insert(key).inserted { candidates.append(candidate) }
+        }
+
+        isRecovering = false
+        guard !candidates.isEmpty else {
+            let message = "\(summary) · 다시 시도할 영상이 없습니다\(errorSuffix)."
+            recoveryNotice = message
+            statusMessage = message
+            return
+        }
+        recoveryNotice = "\(summary) · 실패/건너뜀 및 정리된 영상 \(candidates.count)개만 다시 시도합니다\(errorSuffix)."
+        startTargetedRetry(candidates, message: "정리·실패 항목 \(candidates.count)개 다시 시도 시작")
+    }
+
+    /// Searches every remaining eligible original again in all selected folders.
+    func rescanRemainingEligible() {
+        guard !hasActiveWork else {
+            statusMessage = "진행 중인 작업이 있어 다시 찾기를 시작하지 않았습니다."
+            return
+        }
+        if isExternalWorkActive?() == true {
+            statusMessage = "이 앱에서 다른 변환이 진행 중이라 다시 찾기를 시작하지 않았습니다."
+            return
+        }
+        beginFullRescan(message: "남은 원본 영상 전체 탐색 및 변환 시작")
+    }
+
+    private func beginFullRescan(message: String, seed: [LocalDiscoveredFile] = []) {
+        guard !isRunning, !isRecovering else { return }
+        let readyFolders = folders.filter { $0.status.isReady }
+        guard !readyFolders.isEmpty else { return }
+        guard preflightConversionTools() else { return }
+
+        currentRunGeneration += 1
+        pendingCandidates = seed
+        failedIdentitiesInPass.removeAll()
+        isTargetedRetry = false
+        targetedTotal = 0
+
+        for folder in readyFolders {
+            folderCursors[folder.id]?.reset()
+        }
+
+        counters = LocalConversionCounters()
+        isRunning = true
+        isPaused = false
+        statusMessage = message
+        scheduleWork()
+    }
+
+    private func startTargetedRetry(_ candidates: [LocalDiscoveredFile], message: String) {
+        guard !candidates.isEmpty, !isRunning, !isRecovering else { return }
+        guard preflightConversionTools() else { return }
+        currentRunGeneration += 1
+        failedIdentitiesInPass.removeAll()
+        pendingCandidates = candidates
+        targetedTotal = candidates.count
+        isTargetedRetry = true
+
+        counters = LocalConversionCounters()
+        isRunning = true
+        isPaused = false
+        statusMessage = message
+        scheduleWork()
     }
 
     // MARK: - On-Demand Scheduling & Streaming Discovery
@@ -868,6 +1506,13 @@ final class LocalConversionCoordinator: ObservableObject {
 
         guard freeSlots > 0 else {
             updateQueueSummary()
+            return
+        }
+
+        // Targeted retry is a finite list: it never pulls from folder cursors.
+        if isTargetedRetry {
+            updateQueueSummary()
+            checkOverallCompletion()
             return
         }
 
@@ -972,6 +1617,27 @@ final class LocalConversionCoordinator: ObservableObject {
             return
         }
 
+        // Shared device lease for the whole worker lifecycle: a running cleanup excludes it atomically.
+        guard let lease = LocalRecoveryExclusion.shared.acquireShared() else {
+            pin.close()
+            counters.skippedCount += 1
+            appendRecentItem(
+                LocalConversionItem(
+                    id: itemID,
+                    folderID: folderID,
+                    sourceURL: candidate.url,
+                    relativePath: candidate.relativePath,
+                    relativeComponents: candidate.relativeComponents,
+                    fileSize: candidate.fileSize,
+                    identity: candidate.identity,
+                    stage: .skipped("정리 작업이 진행 중이어서 시작하지 않았습니다. 잠시 뒤 다시 시도해 주세요."),
+                    statusMessage: "정리 작업 중이라 시작하지 않음"
+                )
+            )
+            scheduleWork()
+            return
+        }
+
         let attemptID = UUID().uuidString.lowercased()
         let engineRef = "local-\(attemptID)"
 
@@ -1000,7 +1666,8 @@ final class LocalConversionCoordinator: ObservableObject {
             fileSize: candidate.fileSize,
             expectedIdentity: candidate.identity,
             attemptID: attemptID,
-            engineRef: engineRef
+            engineRef: engineRef,
+            publishedResume: candidate.publishedResume
         )
 
         activeItemFolders[itemID] = folderID
@@ -1010,7 +1677,10 @@ final class LocalConversionCoordinator: ObservableObject {
         let downloadLimit = self.downloadLimiter
         let encodeLimit = self.encodeLimiter
         let task = Task.detached(priority: .userInitiated) { [weak self] in
-            defer { pin.close() }
+            defer {
+                pin.close()
+                lease.release()
+            }
 
             let result = await LocalConversionWorker.performConversion(
                 context: context,
@@ -1054,6 +1724,10 @@ final class LocalConversionCoordinator: ObservableObject {
             updateItemStage(itemID, stage: .skipped(msg), message: msg)
         case .cancelled:
             updateItemStage(itemID, stage: .cancelled, message: "작업 취소됨")
+        case .identityRefresh:
+            // Resolved inside the worker; defensively treated as a safe skip (original kept).
+            counters.skippedCount += 1
+            updateItemStage(itemID, stage: .skipped("원본 정보 변경으로 건너뜀(원본 유지)"), message: "원본 정보 변경으로 건너뜀")
         }
 
         activeTasks.removeValue(forKey: itemID)
@@ -1079,7 +1753,7 @@ final class LocalConversionCoordinator: ObservableObject {
         }
 
         let readyFolders = folders.filter { $0.status.isReady }
-        let anyRemaining = readyFolders.contains { folder in
+        let anyRemaining = !isTargetedRetry && readyFolders.contains { folder in
             if let cursor = folderCursors[folder.id] {
                 return !cursor.isExhausted && cursor.lastError == nil
             }
@@ -1092,17 +1766,23 @@ final class LocalConversionCoordinator: ObservableObject {
         }
 
         guard isRunning else { return }
+        let wasTargeted = isTargetedRetry
         isRunning = false
         isPaused = false
         isSearching = false
+        isTargetedRetry = false
 
-        let folderErrors = readyFolders.compactMap { folderCursors[$0.id]?.lastError }
-        if !folderErrors.isEmpty {
+        let folderErrors = wasTargeted ? [] : readyFolders.compactMap { folderCursors[$0.id]?.lastError }
+        if wasTargeted {
+            statusMessage = "다시 시도 종료: 완료 \(counters.completedCount)개, 실패 \(counters.failedCount)개, 건너뜀 \(counters.skippedCount)개"
+        } else if !folderErrors.isEmpty {
             statusMessage = "변환 완료 (일부 폴더 오류 발생: \(folderErrors.first ?? "")) - 처리 \(counters.handledCount)개"
         } else if counters.failedCount > 0 {
             statusMessage = "변환 종료: 완료 \(counters.completedCount)개, 실패 \(counters.failedCount)개, 건너뜀 \(counters.skippedCount)개"
         } else if counters.handledCount > 0 {
-            statusMessage = "모든 변환 작업 완료 (완료 \(counters.completedCount)개, 실패 0개, 건너뜀 \(counters.skippedCount)개)"
+            statusMessage = counters.skippedCount > 0
+                ? "변환 처리 종료: 완료 \(counters.completedCount)개, 실패 0개, 건너뜀 \(counters.skippedCount)개 (건너뛴 항목은 원본 유지, 기록에서 사유 확인)"
+                : "모든 변환 작업 완료 (완료 \(counters.completedCount)개, 실패 0개, 건너뜀 0개)"
         } else {
             statusMessage = "변환 대상 파일을 찾지 못했습니다."
         }
@@ -1114,15 +1794,30 @@ final class LocalConversionCoordinator: ObservableObject {
 
     // MARK: - History & UI Updates
 
+    private func pruneRecentItems() {
+        var completedCount = 0
+        var filtered: [LocalConversionItem] = []
+        for item in recentItems {
+            if item.stage == .completed {
+                completedCount += 1
+                if completedCount <= 500 {
+                    filtered.append(item)
+                }
+            } else {
+                filtered.append(item)
+            }
+        }
+        recentItems = filtered
+    }
+
     private func appendRecentItem(_ item: LocalConversionItem) {
         if let idx = recentItems.firstIndex(where: { $0.id == item.id }) {
             recentItems[idx] = item
         } else {
             recentItems.insert(item, at: 0)
-            if recentItems.count > Self.maxRecentHistoryCount {
-                recentItems.removeLast()
-            }
         }
+        pruneRecentItems()
+        persistIfTerminal(item)
     }
 
     private func updateItemStage(_ itemID: UUID, stage: LocalConversionStage, message: String) {
@@ -1140,6 +1835,7 @@ final class LocalConversionCoordinator: ObservableObject {
             if stage.isTerminal {
                 recentItems[idx].fraction = nil
             }
+            persistIfTerminal(recentItems[idx])
         }
     }
 
@@ -1168,5 +1864,81 @@ final class LocalConversionCoordinator: ObservableObject {
             skippedCount: counters.skippedCount,
             totalCount: counters.discoveredCount
         )
+    }
+
+    // MARK: - Diagnostics Export
+
+    /// Pasteable plain-text diagnostics. Reads only in-memory state, the persisted history records and executable
+    /// existence; it never scans folders or touches the network. File names are shown without their folders, absolute
+    /// user locations inside reasons are masked, and no bookmark, URL or credential is ever included.
+    func buildDiagnosticReport() async -> String {
+        // Every persisted record (failed/skipped are never capped) plus live state; live state wins per record.
+        let persisted: [LocalConversionItem] = await withCheckedContinuation { continuation in
+            LocalConversionHistoryStore.shared.load { outcome in
+                continuation.resume(returning: outcome.items)
+            }
+        }
+        var merged: [UUID: LocalConversionItem] = [:]
+        for item in persisted { merged[item.id] = item }
+        for item in recentItems { merged[item.id] = item }
+        let records = merged.values
+            .filter { $0.stage.isFailed || $0.stage.isSkipped }
+            .sorted { $0.addedDate > $1.addedDate }
+
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "알 수 없음"
+        let build = info["CFBundleVersion"] as? String ?? "알 수 없음"
+        let stamp = info["BuildStamp"] as? String ?? "알 수 없음"
+        let environment = NASToolEnvironment.detect()
+
+        let dateFormatter = ISO8601DateFormatter()
+        dateFormatter.timeZone = .current
+        dateFormatter.formatOptions = [.withInternetDateTime]
+
+        var lines: [String] = []
+        lines.append("=== NasFinder Super Thumbnail 진단 내용 ===")
+        lines.append("생성 시각: \(dateFormatter.string(from: Date()))")
+        lines.append("앱 버전: \(version) (빌드 \(build), 표시 \(stamp))")
+        lines.append("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString) · 실행 아키텍처: \(NASDiagnosticRedaction.machineArchitecture) · 앱 빌드 아키텍처: \(NASToolEnvironment.compiledArchitecture)")
+        lines.append("")
+        lines.append("[변환 도구]")
+        lines.append(contentsOf: environment.diagnosticReportLines)
+        if !environment.isReadyToExecute {
+            lines.append("안내: \(environment.diagnosticMessage)")
+        }
+        lines.append("")
+        lines.append("[현재 상태]")
+        lines.append("상태 문구: \(NASDiagnosticRedaction.redact(statusMessage))")
+        if let notice = recoveryNotice {
+            lines.append("안내 문구: \(NASDiagnosticRedaction.redact(notice))")
+        }
+        if !recoveryDetails.isEmpty {
+            lines.append("[중단 작업 복구 상세 \(recoveryDetails.count)건]")
+            lines.append(contentsOf: recoveryDetails.map(NASDiagnosticRedaction.redact))
+        }
+        lines.append("실행 중: \(isRunning ? "예" : "아니오") · 일시정지: \(isPaused ? "예" : "아니오") · 동시 변환 설정: \(maxConcurrentConversions)")
+        lines.append("카운터: 발견 \(counters.discoveredCount) · 완료 \(counters.completedCount) · 실패 \(counters.failedCount) · 건너뜀 \(counters.skippedCount) · 진행 중 \(counters.inProgressCount)")
+        let readyCount = folders.filter { $0.status.isReady }.count
+        lines.append("선택 폴더: \(folders.count)개 (사용 가능 \(readyCount)개)")
+        for (index, folder) in folders.enumerated() {
+            lines.append("  폴더 \(index + 1): \(NASDiagnosticRedaction.redact(folder.status.userMessage))")
+        }
+        if let notice = historyLoadNotice {
+            lines.append("기록 읽기 안내: \(NASDiagnosticRedaction.redact(notice))")
+        }
+        if let notice = historySaveNotice {
+            lines.append("기록 저장 안내: \(NASDiagnosticRedaction.redact(notice))")
+        }
+        lines.append("")
+        let failedTotal = records.filter { $0.stage.isFailed }.count
+        lines.append("[실패·건너뜀 기록 전체 \(records.count)건 (실패 \(failedTotal) · 건너뜀 \(records.count - failedTotal)), 최신순]")
+        if records.isEmpty {
+            lines.append("기록 없음")
+        }
+        for item in records {
+            let reason = item.stage.detailText ?? item.statusMessage
+            lines.append("\(dateFormatter.string(from: item.addedDate)) | \(item.stage.shortBadge) | \(item.fileName) | \(NASDiagnosticRedaction.redact(reason))")
+        }
+        return lines.joined(separator: "\n")
     }
 }

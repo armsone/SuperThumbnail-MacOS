@@ -312,9 +312,12 @@ def validate_request(run: Run, data: Any, op: str) -> Dict[str, Any]:
     if isinstance(data.get("ref"), str) and REF_RE.fullmatch(data["ref"]):
         run.ref = data["ref"]
     second = "output" if op == "encode-local" else "candidate"
-    check_keys(data, {"schema", "operation", "job_id", "root", "source", second}, {"ref"}, "요청")
+    check_keys(data, {"schema", "operation", "job_id", "root", "source", second},
+               {"ref"} | ({"allow_clock_recovery"} if op == "encode-local" else set()), "요청")
     if data["schema"] != SCHEMA or type(data["schema"]) is not int or data["operation"] != op:
         raise bad_request("schema 또는 operation 이 올바르지 않습니다.")
+    if "allow_clock_recovery" in data and data["allow_clock_recovery"] is not True:
+        raise bad_request("allow_clock_recovery 는 true 일 때만 보낼 수 있습니다.")
     if run.job_id != data["job_id"] or ("ref" in data and run.ref != data["ref"]):
         raise bad_request("job_id 또는 ref 형식이 올바르지 않습니다.")
     root = data["root"]
@@ -489,6 +492,7 @@ def encode_local(run: Run, req: Dict[str, Any]) -> str:
     temp_path = f"{out_dir}/.{stem}.{uuid.uuid4().hex[:8]}.tmp.mp4"
     w.current_target_dir = out_dir
     linked = False
+    w.CLOCK_RECOVERY = req.get("allow_clock_recovery") is True  # opt-in of the local Mac app only; default off
     try:
         ok, msg = w.convert_and_verify(src_path, temp_path, {}, run.report)
         run.raise_if_cancelled()
@@ -522,6 +526,18 @@ def encode_local(run: Run, req: Dict[str, Any]) -> str:
             raise Stop("failed", "encode_failed", "게시된 결과 파일이 검증한 임시 파일과 다릅니다.")
         linked = False
         run.extra["output"] = {"path": req["output"]["path"], "size": st_out.st_size, "sha256": out_sha}
+        # Structured, machine-readable: true for EVERY output built on a repaired video clock, a re-encode recovering from source decoder messages or a normalised AVI header - the caller must keep the original.
+        recovery = w.clock_recovery_result
+        header = w.header_recovery_result  # malformed AVI header normalised in a read-only view: the original must be kept as well
+        run.extra["retain_original"] = recovery is not None or header is not None
+        if header is not None:
+            run.extra["header_recovery"] = {"kind": "avi_avcc_header", "video_packets": header["video_packets"],
+                                            "audio_packets": header["audio_packets"]}
+        if recovery is not None and recovery["clock_clean"]:
+            run.extra["decode_message_recovery"] = {"frames": recovery["frames"]}  # clean clock, only the source's decoder messages
+        elif recovery is not None:
+            run.extra["clock_recovery"] = {"frames": recovery["frames"], "ties": recovery["ties"],
+                                           "terminal_derived": recovery["terminal_derived"]}
         return msg
     finally:
         if linked:  # published but not confirmed: take back only the link to the inode this process created

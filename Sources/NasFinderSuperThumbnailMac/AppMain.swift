@@ -1,13 +1,34 @@
 import AppKit
+import Combine
 import ImageIO
 import SwiftUI
 
 @main
 struct NasFinderSuperThumbnailMacApp: App {
-    @StateObject private var model = SuperThumbnailMacModel.shared
-    @StateObject private var helperCoordinator = NASHelperCoordinator()
-    @StateObject private var localCoordinator = LocalConversionCoordinator()
-    @StateObject private var updateController = UpdateController()
+    @StateObject private var model: SuperThumbnailMacModel
+    @StateObject private var helperCoordinator: NASHelperCoordinator
+    @StateObject private var localCoordinator: LocalConversionCoordinator
+    @StateObject private var updateController: UpdateController
+
+    init() {
+        // 업데이트 설치 보류 판단은 창 표시와 무관해야 하므로 앱 생성 시점에 작업 상태 관찰을 연결한다.
+        let model = SuperThumbnailMacModel.shared
+        let helper = NASHelperCoordinator()
+        let local = LocalConversionCoordinator()
+        let updater = UpdateController()
+        updater.observeActivity(
+            changes: [
+                model.objectWillChange.map { _ in () }.eraseToAnyPublisher(),
+                helper.objectWillChange.map { _ in () }.eraseToAnyPublisher(),
+                local.objectWillChange.map { _ in () }.eraseToAnyPublisher()
+            ],
+            snapshot: { UpdateWorkActivity(model: model, helper: helper, local: local) }
+        )
+        _model = StateObject(wrappedValue: model)
+        _helperCoordinator = StateObject(wrappedValue: helper)
+        _localCoordinator = StateObject(wrappedValue: local)
+        _updateController = StateObject(wrappedValue: updater)
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -32,6 +53,10 @@ struct NasFinderSuperThumbnailMacApp: App {
                 .disabled(!updateController.canCheckForUpdates)
                 Button(UpdatePreferenceLogic.statusText(automaticDownloadEnabled: updateController.automaticDownloadEnabled)) {}
                     .disabled(true)
+                if let installStatus = updateController.installStatusText {
+                    Button(installStatus) {}
+                        .disabled(true)
+                }
             }
             CommandMenu("작업") {
                 Toggle("동시 작업자 자동 조절", isOn: Binding(

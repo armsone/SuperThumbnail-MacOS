@@ -1,0 +1,38 @@
+[
+  {
+    "arch": "arm64",
+    "tool": "ffmpeg",
+    "url": "https://www.osxexperts.net/ffmpeg9arm.zip",
+    "sha256": "591260c945d0eef150e3bf82b0ef988bd36a9cecc18ff05d6679617159f0a95e"
+  },
+  {
+    "arch": "arm64",
+    "tool": "ffprobe",
+    "url": "https://www.osxexperts.net/ffprobe9arm.zip",
+    "sha256": "e11c17e8200b3ee4c4c186d245e2b4053f01d56957336c1817fca0b997469106"
+  },
+  {
+    "arch": "x86_64",
+    "tool": "ffmpeg",
+    "url": "https://www.osxexperts.net/ffmpeg80intel.zip",
+    "sha256": "df3f1e3facdc1ae0ad0bd898cdfb072fbc9641bf47b11f172844525a05db8d11"
+  },
+  {
+    "arch": "x86_64",
+    "tool": "ffprobe",
+    "url": "https://www.osxexperts.net/ffprobe80intel.zip",
+    "sha256": "5228e651e2bd67bb55819b27f6138351587b16d2b87446007bf35b7cf930d891"
+  },
+  {
+    "arch": "arm64",
+    "tool": "python",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16%2B20261026-aarch64-apple-darwin-install_only_stripped.tar.gz",
+    "sha256": "353d5f1b4fd2715e7053f12f068435d5bbad16b91e057006b5d01e0925709a7e"
+  },
+  {
+    "arch": "x86_64",
+    "tool": "python",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16%2B20261026-x86_64-apple-darwin-install_only_stripped.tar.gz",
+    "sha256": "37c38fda76fec1fbf310adcbafb7f0d96af13b5511bf8ea954c3aa8eec185734"
+  }
+]

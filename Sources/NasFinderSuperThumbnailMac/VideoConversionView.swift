@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Native video conversion view for SuperThumbnail Mac ("영상 변환").
 ///
@@ -22,6 +23,8 @@ struct VideoConversionView: View {
     @State private var showingThemePicker = false
     @State private var isLongPressActive = false
     @State private var showingVideoSettings = false
+    @State private var showingHistorySheet = false
+    @State private var recoveryDetailsExpanded = false
 
     // MARK: - Computed Theme & Palette
 
@@ -192,6 +195,13 @@ struct VideoConversionView: View {
         .sheet(isPresented: $showingVideoSettings) {
             NASHelperDetailsSheet(coordinator: helperCoordinator, palette: palette, isPresented: $showingVideoSettings)
         }
+        .sheet(isPresented: $showingHistorySheet) {
+            VideoConversionHistorySheet(
+                coordinator: coordinator,
+                palette: palette,
+                isPresented: $showingHistorySheet
+            )
+        }
         .onAppear {
             coordinator.onRouteToNAS = { [weak helperCoordinator] url in
                 helperCoordinator?.addFolderURLs([url])
@@ -199,7 +209,15 @@ struct VideoConversionView: View {
             helperCoordinator.isLocalWorkActive = { [weak coordinator] in
                 coordinator?.hasActiveWork ?? false
             }
+            coordinator.isExternalWorkActive = { [weak helperCoordinator] in
+                helperCoordinator?.hasActiveWork ?? false
+            }
         }
+    }
+
+    /// Folder controls stay locked while a conversion run or a cleanup/retry is in progress.
+    private var foldersLocked: Bool {
+        isAnyRunning || coordinator.isRecovering
     }
 
     // MARK: - Header View
@@ -224,6 +242,16 @@ struct VideoConversionView: View {
             Spacer()
 
             themeToggleButton
+
+            Button {
+                showingHistorySheet = true
+            } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .foregroundStyle(secondaryColor)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("전체 기록 보기")
+            .help("전체 변환 기록 보기")
 
             Button {
                 showingVideoSettings = true
@@ -378,24 +406,89 @@ struct VideoConversionView: View {
 
     @ViewBuilder
     private var gatingAndNoticeBanners: some View {
-        if let notice = coordinator.recoveryNotice {
-            HStack(spacing: 8) {
-                Image(systemName: "info.circle.fill")
-                    .foregroundStyle(accentColor)
-                Text(notice)
-                    .font(.caption)
-                    .foregroundStyle(primaryColor)
-                Spacer()
+        VStack(spacing: 10) {
+            if coordinator.isRecovering {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("중단된 작업 표시를 정리하고 다시 시도할 영상을 확인하는 중...")
+                        .font(.caption)
+                        .foregroundStyle(primaryColor)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(accentSoftColor, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    isAutoTheme
+                        ? nil
+                        : RoundedRectangle(cornerRadius: 8).stroke(palette.accent.opacity(0.3), lineWidth: 1)
+                )
+            } else if let notice = coordinator.recoveryNotice {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(accentColor)
+                        Text(notice)
+                            .font(.caption)
+                            .foregroundStyle(primaryColor)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
+                    if !coordinator.recoveryDetails.isEmpty {
+                        DisclosureGroup("자세히 보기", isExpanded: $recoveryDetailsExpanded) {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    ForEach(Array(coordinator.recoveryDetails.enumerated()), id: \.offset) { _, line in
+                                        Text(line)
+                                            .font(.caption2)
+                                            .foregroundStyle(line.hasPrefix("[폴더 오류]") ? dangerColor : secondaryColor)
+                                            .textSelection(.enabled)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                            .frame(maxHeight: 220)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(primaryColor)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(accentSoftColor, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    isAutoTheme
+                        ? nil
+                        : RoundedRectangle(cornerRadius: 8).stroke(palette.accent.opacity(0.3), lineWidth: 1)
+                )
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(accentSoftColor, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                isAutoTheme
-                    ? nil
-                    : RoundedRectangle(cornerRadius: 8).stroke(palette.accent.opacity(0.3), lineWidth: 1)
-            )
+
+            if let loadNotice = coordinator.historyLoadNotice {
+                historyNoticeRow(loadNotice)
+            }
+            if let saveNotice = coordinator.historySaveNotice {
+                historyNoticeRow(saveNotice)
+            }
         }
+    }
+
+    private func historyNoticeRow(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(warnColor)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(primaryColor)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(warnSoftColor, in: RoundedRectangle(cornerRadius: 8))
     }
 
     // MARK: - Folder Management Card (작업 폴더)
@@ -415,13 +508,13 @@ struct VideoConversionView: View {
                     }
                     .font(.caption)
                     .buttonStyle(.borderless)
-                    .disabled(isAnyRunning)
+                    .disabled(foldersLocked)
                 }
 
                 Button("폴더 선택") {
                     chooseFolders()
                 }
-                .disabled(isAnyRunning)
+                .disabled(foldersLocked)
                 .accessibilityLabel("작업 폴더 선택")
             }
 
@@ -476,7 +569,7 @@ struct VideoConversionView: View {
                     .foregroundStyle(secondaryColor)
             }
             .buttonStyle(.plain)
-            .disabled(isAnyRunning)
+            .disabled(foldersLocked)
             .help("목록에서 제거")
             .accessibilityLabel("\(folder.displayName) 제거")
         }
@@ -667,7 +760,7 @@ struct VideoConversionView: View {
                     .foregroundStyle(accentColor)
             }
 
-            phaseProgress(item.phaseLabel ?? item.stage.displayName,
+            phaseProgress(item.phaseLabel ?? item.statusMessage,
                           fraction: item.fraction,
                           active: item.stage.isRunning)
 
@@ -813,11 +906,18 @@ struct VideoConversionView: View {
     private var recentActivityCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label("최근 변환 기록" + (coordinator.recentItems.isEmpty ? "" : " (\(coordinator.recentItems.count))"), systemImage: "clock.arrow.circlepath")
+                Label("변환 기록" + (coordinator.recentItems.isEmpty ? "" : " (\(coordinator.recentItems.count))"), systemImage: "clock.arrow.circlepath")
                     .font(.headline)
                     .foregroundStyle(primaryColor)
 
                 Spacer()
+
+                Button("전체 기록 보기") {
+                    showingHistorySheet = true
+                }
+                .font(.caption)
+                .buttonStyle(.borderless)
+                .accessibilityLabel("전체 기록 보기")
 
                 if !coordinator.recentItems.isEmpty {
                     Button("기록 지우기") {
@@ -839,8 +939,16 @@ struct VideoConversionView: View {
                 }
             } else {
                 VStack(spacing: 6) {
-                    ForEach(coordinator.recentItems.prefix(10)) { item in
+                    ForEach(coordinator.recentItems.prefix(15)) { item in
                         recentItemRow(item)
+                    }
+                    if coordinator.recentItems.count > 15 {
+                        Button("전체 기록 \(coordinator.recentItems.count)개 보기...") {
+                            showingHistorySheet = true
+                        }
+                        .font(.caption)
+                        .buttonStyle(.borderless)
+                        .padding(.top, 4)
                     }
                 }
             }
@@ -851,22 +959,24 @@ struct VideoConversionView: View {
 
     private func recentItemRow(_ item: LocalConversionItem) -> some View {
         HStack {
-            Image(systemName: item.stage == .completed ? "checkmark.circle.fill" : (item.stage.displayName.hasPrefix("실패") ? "xmark.circle.fill" : "info.circle"))
+            Image(systemName: item.stage == .completed ? "checkmark.circle.fill" : (item.stage.isFailed ? "xmark.circle.fill" : "info.circle"))
                 .font(.caption2)
-                .foregroundStyle(item.stage == .completed ? Color.green : (item.stage.displayName.hasPrefix("실패") ? dangerColor : secondaryColor))
+                .foregroundStyle(item.stage == .completed ? Color.green : (item.stage.isFailed ? dangerColor : secondaryColor))
 
             Text(item.fileName)
                 .font(.caption2.bold())
                 .foregroundStyle(primaryColor)
                 .lineLimit(1)
+                .textSelection(.enabled)
 
             Spacer()
 
-            Text(item.statusMessage)
+            Text(item.stage.shortBadge)
                 .font(.caption2)
                 .foregroundStyle(secondaryColor)
                 .lineLimit(1)
         }
+        .help(item.stage.detailText ?? item.statusMessage)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(rowBackground)
@@ -882,7 +992,7 @@ struct VideoConversionView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 12) {
-                Text("SuperThumbnail v2.7.3 • macOS 네이티브 영상 변환")
+                Text("SuperThumbnail v2.7.15 • macOS 네이티브 영상 변환")
                     .font(.caption2)
                     .foregroundStyle(secondaryColor)
 
@@ -937,14 +1047,14 @@ struct VideoConversionView: View {
                     .controlSize(.large)
                     .accessibilityLabel("변환 중지")
                 } else {
-                    Button("변환 시작") {
+                    Button(coordinator.isRecovering ? "준비 중…" : "변환 시작") {
                         startUnifiedConversion()
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(!canStartAny)
+                    .disabled(!canStartAny || coordinator.isRecovering)
                     .help(startHelpText)
-                    .accessibilityLabel("변환 시작")
+                    .accessibilityLabel(coordinator.isRecovering ? "준비 중…" : "변환 시작")
                 }
             }
         }
@@ -963,7 +1073,7 @@ struct VideoConversionView: View {
         if directFolders.isEmpty && targetedHelperFolderIDs.isEmpty {
             return "선택한 폴더에 연결할 수 있는지 확인해 주세요."
         }
-        return "선택한 폴더의 영상 변환을 시작합니다."
+        return "완료된 영상은 제외하고, 중단되거나 실패한 영상은 자동으로 포함해 변환합니다."
     }
 
     private func startUnifiedConversion() {
@@ -981,5 +1091,342 @@ struct VideoConversionView: View {
         } else if !targets.isEmpty {
             helperCoordinator.startHelper(targetFolderIDs: targets)
         }
+    }
+}
+
+// MARK: - Video Conversion Full History Sheet
+
+struct VideoConversionHistorySheet: View {
+    @ObservedObject var coordinator: LocalConversionCoordinator
+    let palette: ByungkiPalette
+    @Binding var isPresented: Bool
+
+    @State private var filterSelection: HistoryFilter = .all
+    @State private var searchText: String = ""
+    @State private var diagnosticCopyNotice: String?
+    @State private var isCopyingDiagnostics = false
+    @State private var diagnosticSaveFailed = false
+    @State private var savedDiagnosticURL: URL?
+
+    enum HistoryFilter: String, CaseIterable, Identifiable {
+        case all = "전체"
+        case failed = "실패"
+        case skipped = "건너뜀"
+        case completed = "완료"
+
+        var id: String { rawValue }
+    }
+
+    private var allCount: Int { coordinator.recentItems.count }
+    private var failedCount: Int {
+        coordinator.recentItems.filter {
+            if case .failed = $0.stage { return true }
+            return false
+        }.count
+    }
+    private var skippedCount: Int {
+        coordinator.recentItems.filter {
+            if case .skipped = $0.stage { return true }
+            return false
+        }.count
+    }
+    private var completedCount: Int {
+        coordinator.recentItems.filter { $0.stage == .completed }.count
+    }
+
+    private var filteredItems: [LocalConversionItem] {
+        var items = coordinator.recentItems
+        switch filterSelection {
+        case .all:
+            break
+        case .failed:
+            items = items.filter {
+                if case .failed = $0.stage { return true }
+                return false
+            }
+        case .skipped:
+            items = items.filter {
+                if case .skipped = $0.stage { return true }
+                return false
+            }
+        case .completed:
+            items = items.filter { $0.stage == .completed }
+        }
+
+        if !searchText.isEmpty {
+            let query = searchText.lowercased()
+            items = items.filter {
+                $0.fileName.lowercased().contains(query) ||
+                $0.statusMessage.lowercased().contains(query) ||
+                ($0.stage.detailText ?? "").lowercased().contains(query) ||
+                $0.relativePath.lowercased().contains(query)
+            }
+        }
+        return items
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 12) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.title2.bold())
+                    .foregroundStyle(palette.accent)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("영상 변환 기록")
+                        .font(.headline.bold())
+                        .foregroundStyle(palette.text)
+                    Text("전체 \(allCount)개 · 실패 \(failedCount)개 · 건너뜀 \(skippedCount)개 · 완료 \(completedCount)개")
+                        .font(.caption)
+                        .foregroundStyle(palette.text2)
+                }
+
+                Spacer()
+
+                Button("닫기") {
+                    isPresented = false
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .background(palette.card)
+
+            Divider()
+
+            // Filter Toolbar
+            HStack(spacing: 12) {
+                Picker("필터", selection: $filterSelection) {
+                    Text("전체 (\(allCount))").tag(HistoryFilter.all)
+                    Text("실패 (\(failedCount))").tag(HistoryFilter.failed)
+                    Text("건너뜀 (\(skippedCount))").tag(HistoryFilter.skipped)
+                    Text("완료 (\(completedCount))").tag(HistoryFilter.completed)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 380)
+
+                Spacer()
+
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(palette.text2)
+                    TextField("파일명 또는 오류 검색", text: $searchText)
+                        .textFieldStyle(.plain)
+                    if !searchText.isEmpty {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(palette.text2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(palette.surface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(palette.border2, lineWidth: 0.5))
+                .frame(width: 220)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(palette.bg)
+
+            Divider()
+
+            // Scrollable List
+            if filteredItems.isEmpty {
+                VStack(spacing: 10) {
+                    Spacer()
+                    Image(systemName: "tray")
+                        .font(.system(size: 36))
+                        .foregroundStyle(palette.text2)
+                    Text(searchText.isEmpty ? "해당 조건의 변환 기록이 없습니다." : "검색 결과가 없습니다.")
+                        .font(.subheadline)
+                        .foregroundStyle(palette.text2)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(filteredItems) { item in
+                            historyItemCard(item)
+                        }
+                    }
+                    .padding(20)
+                }
+            }
+
+            Divider()
+
+            // Footer
+            VStack(alignment: .leading, spacing: 8) {
+              HStack(spacing: 12) {
+                Button("기록 지우기", role: .destructive) {
+                    coordinator.clearHistory()
+                }
+                .disabled(coordinator.recentItems.isEmpty)
+                .help("기록 목록만 지웁니다. 영상 파일이나 중단된 작업 표시는 삭제되지 않습니다.")
+
+                Button("진단 내용 복사") {
+                    copyDiagnostics()
+                }
+                .disabled(isCopyingDiagnostics)
+                .help("앱 버전, 변환 도구 상태, 모든 실패·건너뜀 사유를 한 번에 복사합니다. 폴더 경로·인증 정보는 포함하지 않으며 자동으로 전송되지 않습니다.")
+                .accessibilityLabel("진단 내용 복사")
+
+                Button("로그 파일 저장") {
+                    saveDiagnosticsFile()
+                }
+                .disabled(isCopyingDiagnostics)
+                .help("진단 내용을 .txt 파일로 저장합니다. 복사와 같은 내용이며 자동으로 전송되지 않습니다.")
+                .accessibilityLabel("로그 파일 저장")
+
+                if let savedURL = savedDiagnosticURL {
+                    Button("저장 위치 열기") {
+                        NSWorkspace.shared.activateFileViewerSelecting([savedURL])
+                    }
+                    .accessibilityLabel("저장 위치 열기")
+                }
+
+                Spacer()
+
+                Button("닫기") {
+                    isPresented = false
+                }
+                .controlSize(.regular)
+              }
+              if let copyNotice = diagnosticCopyNotice {
+                  Text(copyNotice)
+                      .font(.caption2)
+                      .foregroundStyle(diagnosticSaveFailed ? palette.danger : palette.text2)
+                      .textSelection(.enabled)
+              }
+              if let notice = coordinator.historyLoadNotice ?? coordinator.historySaveNotice {
+                  Text(notice)
+                      .font(.caption2)
+                      .foregroundStyle(palette.warn)
+                      .textSelection(.enabled)
+              }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .background(palette.card)
+        }
+        .frame(minWidth: 700, idealWidth: 760, minHeight: 500, idealHeight: 560)
+        .background(palette.bg)
+    }
+
+    private func copyDiagnostics() {
+        isCopyingDiagnostics = true
+        diagnosticCopyNotice = nil
+        diagnosticSaveFailed = false
+        savedDiagnosticURL = nil
+        Task { @MainActor in
+            let report = await coordinator.buildDiagnosticReport()
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            if pasteboard.setString(report, forType: .string) {
+                let lineCount = report.split(separator: "\n", omittingEmptySubsequences: false).count
+                diagnosticCopyNotice = "진단 내용 \(lineCount)줄을 복사했습니다. 대화창에 붙여넣기(⌘V) 하세요."
+            } else {
+                diagnosticCopyNotice = "클립보드에 복사하지 못했습니다. 다시 눌러 주세요."
+            }
+            isCopyingDiagnostics = false
+        }
+    }
+
+    private func saveDiagnosticsFile() {
+        isCopyingDiagnostics = true
+        diagnosticCopyNotice = nil
+        diagnosticSaveFailed = false
+        savedDiagnosticURL = nil
+        Task { @MainActor in
+            defer { isCopyingDiagnostics = false }
+            let report = await coordinator.buildDiagnosticReport()
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.plainText]
+            panel.nameFieldStringValue = "NasFinder-진단-\(formatter.string(from: Date())).txt"
+            panel.directoryURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            panel.canCreateDirectories = true
+            panel.message = "진단 내용을 저장할 위치를 선택하세요."
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            do {
+                try report.write(to: url, atomically: true, encoding: .utf8)
+                savedDiagnosticURL = url
+                diagnosticCopyNotice = "진단 파일을 저장했습니다: \(url.lastPathComponent)"
+            } catch {
+                diagnosticSaveFailed = true
+                diagnosticCopyNotice = "진단 파일을 저장하지 못했습니다: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func historyItemCard(_ item: LocalConversionItem) -> some View {
+        let isFailed: Bool = {
+            if case .failed = item.stage { return true }
+            return false
+        }()
+        let isSkipped: Bool = {
+            if case .skipped = item.stage { return true }
+            return false
+        }()
+        let isCompleted = item.stage == .completed
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isCompleted ? "checkmark.circle.fill" : (isFailed ? "xmark.circle.fill" : (isSkipped ? "exclamationmark.circle.fill" : "info.circle.fill")))
+                    .font(.body)
+                    .foregroundStyle(isCompleted ? Color.green : (isFailed ? palette.danger : palette.warn))
+                    .padding(.top, 2)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(item.fileName)
+                            .font(.body.bold())
+                            .foregroundStyle(palette.text)
+                            .textSelection(.enabled)
+
+                        Spacer()
+
+                        Text(item.stage.shortBadge)
+                            .font(.caption2.bold())
+                            .lineLimit(1)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(isCompleted ? Color.green.opacity(0.12) : (isFailed ? palette.dangerSoft : palette.warnSoft), in: RoundedRectangle(cornerRadius: 4))
+                            .foregroundStyle(isCompleted ? Color.green : (isFailed ? palette.danger : palette.warn))
+
+                        Text(item.addedDate.formatted(date: .numeric, time: .standard))
+                            .font(.caption2)
+                            .foregroundStyle(palette.text2)
+                    }
+
+                    Text(item.relativePath)
+                        .font(.caption2)
+                        .foregroundStyle(palette.text2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+
+                    Text(item.stage.detailText ?? item.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(isFailed ? palette.danger : (isSkipped ? palette.warn : palette.text))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 2)
+                }
+            }
+        }
+        .padding(12)
+        .background(palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.border2, lineWidth: 0.5))
     }
 }

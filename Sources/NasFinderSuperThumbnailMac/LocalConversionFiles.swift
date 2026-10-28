@@ -264,6 +264,34 @@ struct LocalFileIdentity: Hashable, Equatable, Sendable {
         self.ctime_nsec = ctime_nsec
     }
 
+    /// Names every field that differs from `expected` as "field(expected→actual)"; empty when equal. Diagnostics only.
+    func differences(from expected: LocalFileIdentity) -> [String] {
+        var out: [String] = []
+        if device != expected.device { out.append("device(\(expected.device)→\(device))") }
+        if inode != expected.inode { out.append("inode(\(expected.inode)→\(inode))") }
+        if size != expected.size { out.append("size(\(expected.size)→\(size))") }
+        if mtime != expected.mtime || mtime_nsec != expected.mtime_nsec {
+            out.append("mtime(\(expected.mtime).\(expected.mtime_nsec)→\(mtime).\(mtime_nsec))")
+        }
+        if ctime != expected.ctime || ctime_nsec != expected.ctime_nsec {
+            out.append("ctime(\(expected.ctime).\(expected.ctime_nsec)→\(ctime).\(ctime_nsec))")
+        }
+        return out
+    }
+
+    /// True when device, inode, and size equal `other`; mtime/ctime are ignored. Only the NO-DELETE resume uses this
+    /// (WebDAV may flip the shown times of an unchanged file); every deleting path keeps requiring the exact identity.
+    func isSameFile(as other: LocalFileIdentity) -> Bool {
+        device == other.device && inode == other.inode && size == other.size
+    }
+
+    /// True only when device, inode, and size equal `expected` and just mtime and/or ctime differ.
+    func isTimestampOnlyDrift(from expected: LocalFileIdentity) -> Bool {
+        device == expected.device && inode == expected.inode && size == expected.size
+            && (mtime != expected.mtime || mtime_nsec != expected.mtime_nsec
+                || ctime != expected.ctime || ctime_nsec != expected.ctime_nsec)
+    }
+
     static func inspect(fd: Int32) throws -> LocalFileIdentity {
         var info = stat()
         guard fstat(fd, &info) == 0 else {
@@ -340,6 +368,20 @@ struct LocalFileIdentity: Hashable, Equatable, Sendable {
     }
 }
 
+/// Proof, produced by recovery, that an earlier run already published a verified MP4 for this original.
+/// It only lets the worker re-verify that output and finish the thumbnail; it never authorizes deleting the original.
+struct LocalPublishedResumeProof: Equatable, Sendable {
+    let record: LocalJournalRecord
+    let outputIdentity: LocalFileIdentity
+    /// Recovery saw the same original (dev/inode/size) with only a WebDAV-shown mtime difference from the journal.
+    /// Only lets `verifyResumedPublication` skip the journal mtime comparison (and only on a real webdav mount);
+    /// the original is still never deleted on this path.
+    var sourceTimestampDrift: Bool = false
+    /// False for a read-only candidate whose MP4 recovery only matched by journal and size (no full SHA-256 read at start-up).
+    /// The worker never relies on this flag: `verifyResumedPublication` always proves the full SHA-256 before any thumbnail write.
+    var outputHashVerifiedByRecovery: Bool = true
+}
+
 struct LocalDiscoveredFile: Identifiable, Equatable, Sendable {
     let id: UUID
     let folderID: UUID
@@ -348,6 +390,7 @@ struct LocalDiscoveredFile: Identifiable, Equatable, Sendable {
     let relativeComponents: [String]
     let fileSize: Int64
     let identity: LocalFileIdentity
+    let publishedResume: LocalPublishedResumeProof?
 
     init(
         id: UUID = UUID(),
@@ -356,7 +399,8 @@ struct LocalDiscoveredFile: Identifiable, Equatable, Sendable {
         relativePath: String,
         relativeComponents: [String],
         fileSize: Int64,
-        identity: LocalFileIdentity
+        identity: LocalFileIdentity,
+        publishedResume: LocalPublishedResumeProof? = nil
     ) {
         self.id = id
         self.folderID = folderID
@@ -365,6 +409,7 @@ struct LocalDiscoveredFile: Identifiable, Equatable, Sendable {
         self.relativeComponents = relativeComponents
         self.fileSize = fileSize
         self.identity = identity
+        self.publishedResume = publishedResume
     }
 }
 
@@ -766,6 +811,9 @@ struct LocalPublishedThumbnail: Sendable {
     let identity: LocalFileIdentity
     let vaultDevice: dev_t
     let vaultInode: ino_t
+    /// The MP4 identity the key was derived from (server-refreshed on webdav; may differ in times from the identity published earlier).
+    /// The original is only deleted against exactly this identity.
+    let mp4Identity: LocalFileIdentity
 }
 
 enum LocalPublicationManager {
@@ -799,6 +847,62 @@ enum LocalPublicationManager {
     private static func fullSync(_ fd: Int32) -> Bool {
         if fcntl(fd, F_FULLFSYNC) == 0 { return true }
         return fsync(fd) == 0
+    }
+
+    private static func isWebDAV(dirFD: Int32) -> Bool {
+        var fs = statfs()
+        guard fstatfs(dirFD, &fs) == 0 else { return false }
+        return withUnsafeBytes(of: fs.f_fstypename) { raw -> Bool in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
+            return String(cString: base) == "webdav"
+        }
+    }
+
+    /// Real directory enumeration (readdir over a freshly reopened descriptor with its own offset). A webdav client may answer a
+    /// path stat of a just-written file from its inode cache (e.g. with the PARENT directory's time); a full listing makes it
+    /// re-read the server's metadata for every entry, and the next stat shows the server values. Observes `name` in the listing
+    /// (canonical-equivalent compare). Returns false if the directory cannot be listed completely or `name` was not seen.
+    /// Reads only; nothing is written.
+    static func enumerateDirectoryRefreshingMetadata(dirFD: Int32, expecting name: String) -> Bool {
+        let dupFD = openat(dirFD, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard dupFD >= 0 else { return false }
+        var pinned = stat()
+        var reopened = stat()
+        guard fstat(dirFD, &pinned) == 0, fstat(dupFD, &reopened) == 0,
+              pinned.st_dev == reopened.st_dev, pinned.st_ino == reopened.st_ino,
+              let stream = fdopendir(dupFD) else {
+            Darwin.close(dupFD)
+            return false
+        }
+        defer { closedir(stream) }
+        let wanted = name.precomposedStringWithCanonicalMapping
+        var seen = false
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else { return errno == 0 && seen }
+            let entryName = withUnsafeBytes(of: entry.pointee.d_name) { raw -> String in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return "" }
+                return String(cString: base)
+            }
+            if entryName.precomposedStringWithCanonicalMapping == wanted { seen = true }
+        }
+    }
+
+    /// Streams the descriptor from its current offset to EOF (EINTR retried; any other read error throws).
+    static func sha256Streaming(fd: Int32) throws -> (bytes: Int64, digest: String) {
+        var hasher = SHA256()
+        var total: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 512 * 1024)
+        while true {
+            try Task.checkCancellation()
+            let n = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+            if n < 0 && errno == EINTR { continue }
+            if n < 0 { throw posixError(errno, "MP4 읽기 실패") }
+            if n == 0 { break }
+            hasher.update(data: Data(buffer[0..<n]))
+            total += Int64(n)
+        }
+        return (total, hasher.finalize().map { String(format: "%02x", $0) }.joined())
     }
 
     private static func posixError(_ err: Int32, _ message: String) -> NSError {
@@ -1095,21 +1199,265 @@ enum LocalPublicationManager {
         return LocalPublishedMP4(finalFileName: finalFileName, identity: entryIdentity, record: publishedJournal)
     }
 
+    /// Resume entry for an MP4 that an earlier run already published (recovery handed over the proof).
+    /// Nothing is written, replaced or deleted here; the result only feeds `createVerifiedThumbnail`.
+    /// Everything is re-proven under the CURRENT claim before the output is trusted:
+    /// - the current claim is still this process's own (`verifyClaimBeforePublication`);
+    /// - the locked original is the very file the journal recorded (dev/inode/size/mtime seconds) and its directory entry matches the lock;
+    /// - the exact `-published.json` (or, when the original survived a started deletion, `-deleting.json`) journal still holds byte-for-byte-decoded the same record the proof carries;
+    /// - no `_원본` leftover and no stage file exist;
+    /// - the MP4 entry is the same dev/inode/size recovery verified and its full SHA-256 equals the journal.
+    /// Any mismatch throws and leaves every file in place.
+    static func verifyResumedPublication(
+        sourceLock: LocalFileLock,
+        proof: LocalPublishedResumeProof,
+        claim: VideoConversionClaim
+    ) throws -> LocalPublishedMP4 {
+        let dirFD = sourceLock.parentFD
+        let originalFileName = sourceLock.fileName
+        let record = proof.record
+        let stem = (originalFileName as NSString).deletingPathExtension
+        let ext = (originalFileName as NSString).pathExtension
+        guard !stem.isEmpty, !ext.isEmpty, ext.lowercased() != LocalConversionConstants.finalExtension else {
+            throw conversionError(60, "유효하지 않은 원본 파일 이름입니다 (이어서 진행하지 않고 그대로 둡니다).")
+        }
+        let finalFileName = "\(stem).\(LocalConversionConstants.finalExtension)"
+        let backupFileName = "\(stem)\(LocalConversionConstants.backupSuffix).\(ext)"
+        let isDeleting = record.state == .deletionStarted
+        guard record.schema == LocalJournalRecord.currentSchema, record.state == .outputPublished || isDeleting,
+              let attempt = UUID(uuidString: record.attemptID), attempt.uuidString.lowercased() == record.attemptID,
+              record.thumbnailFileName.map({ !$0.isEmpty && (try? NASPathSecurity.checkedComponents([$0])) != nil }) ?? true,
+              record.originalFileName == originalFileName,
+              record.finalFileName == finalFileName,
+              record.backupFileName == backupFileName,
+              record.stagedFileName == ".\(stem).stage-\(record.attemptID).mp4",
+              record.outputSize > 0,
+              record.outputSha256.utf8.count == 64,
+              record.outputSha256.allSatisfy({ "0123456789abcdef".contains($0) }) else {
+            throw conversionError(61, "이전 발행 기록이 이 원본과 정확히 맞지 않아 이어서 진행하지 않습니다 (모든 파일 보존).")
+        }
+        let publishedJournalName = journalName(stem: stem, attemptID: record.attemptID, suffix: isDeleting ? "deleting" : "published")
+        _ = try NASPathSecurity.checkedComponents([finalFileName, backupFileName, record.stagedFileName, publishedJournalName])
+
+        // Current claim must be this process's own, and the original must still be exactly what the journal recorded.
+        try claim.verifyClaimBeforePublication()
+        let lockIdentity = sourceLock.identity
+        var sourceStat = statfs()
+        let sourceIsWebDAV = fstatfs(sourceLock.fd, &sourceStat) == 0 && withUnsafeBytes(of: sourceStat.f_fstypename) { raw -> Bool in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
+            return String(cString: base) == "webdav"
+        }
+        // The original is never touched on this path, so on a real webdav mount only its dev/inode/size are bound (to the journal
+        // and to the lock). The mtime/ctime that mount shows may flip between any two reads, so they are not compared there.
+        // Everywhere else the exact identity and the journal mtime are still required.
+        func sameSource(_ other: LocalFileIdentity) -> Bool {
+            other == lockIdentity || (sourceIsWebDAV && other.isSameFile(as: lockIdentity))
+        }
+        let sourceTimeMatches = Int64(lockIdentity.mtime) == record.sourceMtime || sourceIsWebDAV
+        guard Int64(lockIdentity.device) == record.sourceDevice,
+              UInt64(lockIdentity.inode) == record.sourceInode,
+              lockIdentity.size == record.sourceSize,
+              sourceTimeMatches,
+              let fdNow = try? LocalFileIdentity.inspect(fd: sourceLock.fd), sameSource(fdNow),
+              let entryNow = try? LocalFileIdentity.inspect(dirFD: dirFD, name: originalFileName), sameSource(entryNow) else {
+            throw conversionError(62, "원본이 이전 발행 기록과 다르거나 바뀌어 이어서 진행하지 않습니다 (모든 파일 보존).")
+        }
+
+        var probe = stat()
+        for name in [backupFileName, record.stagedFileName] {
+            if fstatat(dirFD, name, &probe, AT_SYMLINK_NOFOLLOW) == 0 {
+                throw conversionError(63, "보존 이름 또는 스테이징 파일(\(name))이 있어 이어서 진행하지 않습니다 (모든 파일 보존).")
+            }
+            guard errno == ENOENT else {
+                throw posixError(errno, "\(name) 존재 확인 실패: 이어서 진행하지 않습니다")
+            }
+        }
+
+        // The published journal must still decode to exactly the record recovery proved.
+        let journalFD = openat(dirFD, publishedJournalName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard journalFD >= 0 else {
+            throw posixError(errno, "발행 기록 열기 실패: 이어서 진행하지 않습니다")
+        }
+        defer { Darwin.close(journalFD) }
+        var journalStat = stat()
+        guard fstat(journalFD, &journalStat) == 0, (journalStat.st_mode & S_IFMT) == S_IFREG, journalStat.st_nlink == 1,
+              journalStat.st_size > 0, journalStat.st_size <= 64 * 1024 else {
+            throw conversionError(64, "발행 기록 형식이 올바르지 않아 이어서 진행하지 않습니다 (모든 파일 보존).")
+        }
+        var journalBytes = [UInt8](repeating: 0, count: Int(journalStat.st_size))
+        var journalRead = 0
+        while journalRead < journalBytes.count {
+            let n = journalBytes.withUnsafeMutableBytes { Darwin.read(journalFD, $0.baseAddress! + journalRead, $0.count - journalRead) }
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { throw conversionError(64, "발행 기록을 끝까지 읽지 못해 이어서 진행하지 않습니다 (모든 파일 보존).") }
+            journalRead += n
+        }
+        var journalEntry = stat()
+        guard (try? JSONDecoder().decode(LocalJournalRecord.self, from: Data(journalBytes))) == record,
+              fstatat(dirFD, publishedJournalName, &journalEntry, AT_SYMLINK_NOFOLLOW) == 0,
+              journalEntry.st_dev == journalStat.st_dev, journalEntry.st_ino == journalStat.st_ino else {
+            throw conversionError(64, "발행 기록이 증명된 내용과 다르거나 교체되어 이어서 진행하지 않습니다 (모든 파일 보존).")
+        }
+
+        // The MP4: same file recovery verified (dev/inode/size) and the full content hash from the journal.
+        let finalFD = openat(dirFD, finalFileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard finalFD >= 0 else {
+            throw posixError(errno, "발행된 MP4 열기 실패: 이어서 진행하지 않습니다")
+        }
+        defer { Darwin.close(finalFD) }
+        let fdIdentity = try LocalFileIdentity.inspect(fd: finalFD)
+        guard fdIdentity.size == record.outputSize,
+              fdIdentity.device == proof.outputIdentity.device,
+              fdIdentity.inode == proof.outputIdentity.inode,
+              fdIdentity.size == proof.outputIdentity.size else {
+            throw conversionError(65, "발행된 MP4가 복구 때 확인한 파일과 달라 이어서 진행하지 않습니다 (모든 파일 보존).")
+        }
+        var hasher = SHA256()
+        var total: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 512 * 1024)
+        while true {
+            try Task.checkCancellation()
+            let n = buffer.withUnsafeMutableBytes { Darwin.read(finalFD, $0.baseAddress, $0.count) }
+            if n < 0 && errno == EINTR { continue }
+            if n < 0 { throw posixError(errno, "발행된 MP4 읽기 실패: 이어서 진행하지 않습니다") }
+            if n == 0 { break }
+            hasher.update(data: Data(buffer[0..<n]))
+            total += Int64(n)
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard total == record.outputSize, digest == record.outputSha256 else {
+            throw conversionError(66, "발행된 MP4의 크기 또는 SHA-256이 기록과 달라 이어서 진행하지 않습니다 (MP4·원본·기록 보존).")
+        }
+        let entryIdentity = try LocalFileIdentity.inspect(dirFD: dirFD, name: finalFileName)
+        // The hash above is the content proof. A webdav mount may show other times after the read; the same dev/inode/size is enough here
+        // because the thumbnail step re-stabilizes (and re-hashes on any further drift) before it derives or writes anything.
+        guard entryIdentity == fdIdentity || (isWebDAV(dirFD: dirFD) && entryIdentity.isSameFile(as: fdIdentity)) else {
+            throw conversionError(67, "발행된 MP4가 읽는 중 바뀌어 이어서 진행하지 않습니다 (MP4·원본·기록 보존).")
+        }
+        return LocalPublishedMP4(finalFileName: finalFileName, identity: entryIdentity, record: record)
+    }
+
     /// Phase 2. Creates the Super Thumbnail from the actual published MP4 using the existing VaultProcessor
     /// algorithm and Vault file naming (fresh name/size/mtime of the NEW file). The JPEG is written
     /// descriptor-relatively with exclusive publication, then re-read and fully validated. A pre-existing
-    /// artifact at the exact key is accepted only if it is itself a valid JPEG; zero-byte/corrupt entries fail closed.
+    /// artifact at the exact key is accepted only if it is itself a valid JPEG (never overwritten); zero-byte/corrupt entries fail closed.
+    ///
+    /// On a webdav parent (resume AND normal publication) the client may answer the stat of a just-published file from its inode
+    /// cache with a stale time (seen in production: the parent directory's mtime), so the first identity of the MP4 can carry a
+    /// time the server never had. Therefore every identity check first runs a real directory enumeration (`enumerateDirectory
+    /// RefreshingMetadata`) and only then stats the entry. A webdav mount may also show other mtime/ctime for the very same file at
+    /// any moment (also because of our own reads). Only on a webdav parent:
+    /// - a path stat that differs from the expected identity in nothing but times (same dev/inode/size) is accepted AFTER the MP4 is
+    ///   re-hashed through a fresh descriptor and still equals the recorded size/SHA-256 (journal for resume, the verified publication
+    ///   record otherwise); the identity then seen replaces the expected one and is returned as `mp4Identity`
+    ///   (bounded by `resumedRefreshBudget` re-hashes, then it fails closed with the precise differences);
+    /// - the thumbnail key is derived from the exact metadata that was validated, and re-checked against the MP4 identity right before
+    ///   the write and again after it. If the times moved meanwhile, the cached JPEG bytes are published under the recomputed key
+    ///   (at most `resumeRounds` rounds, never overwriting an existing JPEG). A key written earlier stays as a valid orphan JPEG.
+    /// Every other difference (inode, size, content) still fails and the original is never touched or deleted.
+    /// `resumedPublication` only marks the NO-DELETE resume; it no longer changes the webdav tolerance. `assumeWebDAVParent` is a test seam
+    /// that runs the webdav branch on a local directory.
     static func createVerifiedThumbnail(
         sourceLock: LocalFileLock,
-        published: LocalPublishedMP4,
-        finalURL: URL
+        published initialPublished: LocalPublishedMP4,
+        finalURL: URL,
+        resumedPublication: Bool = false,
+        assumeWebDAVParent: Bool = false
     ) async throws -> LocalPublishedThumbnail {
         let dirFD = sourceLock.parentFD
+        var published = initialPublished
+        let parentIsWebDAV = assumeWebDAVParent || isWebDAV(dirFD: dirFD)
+        let resumeTolerance = parentIsWebDAV
+        let resumeRounds = resumeTolerance ? 3 : 1
+        var resumedRefreshBudget = resumeTolerance ? 6 : 0
+
+        func mismatchError(_ steps: [String]) -> NSError {
+            conversionError(25, "썸네일 생성 중 MP4 식별 정보가 변경되었습니다 (원본은 보존됨): \(steps.joined(separator: " | "))")
+        }
+
+        func describe(_ label: String, _ identity: LocalFileIdentity?) -> String {
+            guard let identity else { return "\(label) 확인 불가" }
+            let diff = identity.differences(from: published.identity)
+            return "\(label) " + (diff.isEmpty ? "일치" : diff.joined(separator: ", "))
+        }
+
+        /// Re-opens the MP4 (up to 2 times) so the webdav client refreshes its metadata, then compares both the descriptor and
+        /// the entry with the expected identity. Returns the observations of the last attempt.
+        func reopenObservations() -> (matches: Bool, fd: LocalFileIdentity?, entry: LocalFileIdentity?, note: String) {
+            var fdIdentity: LocalFileIdentity?
+            var entry: LocalFileIdentity?
+            var note = ""
+            for attempt in 0..<2 {
+                if attempt > 0 { usleep(150_000) }
+                let fd = openat(dirFD, published.finalFileName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                guard fd >= 0 else {
+                    note = "재열기 실패(errno \(errno))"
+                    fdIdentity = nil
+                    entry = nil
+                    continue
+                }
+                fdIdentity = try? LocalFileIdentity.inspect(fd: fd)
+                Darwin.close(fd)
+                entry = try? LocalFileIdentity.inspect(dirFD: dirFD, name: published.finalFileName)
+                if let fdIdentity, let entry, fdIdentity == published.identity, entry == published.identity {
+                    return (true, fdIdentity, entry, "")
+                }
+            }
+            return (false, fdIdentity, entry, note)
+        }
+
+        /// Re-proves size + full SHA-256 of the MP4 through one fresh descriptor (same dev/inode/size as expected, times may
+        /// differ) and returns the directory entry's identity seen right after, only if it is still that very file.
+        func rehashedIdentity() throws -> LocalFileIdentity? {
+            let fd = openat(dirFD, published.finalFileName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { return nil }
+            defer { Darwin.close(fd) }
+            guard let before = try? LocalFileIdentity.inspect(fd: fd),
+                  before.isSameFile(as: published.identity),
+                  before.size == published.record.outputSize else { return nil }
+            let hashed = try sha256Streaming(fd: fd)
+            guard hashed.bytes == published.record.outputSize, hashed.digest == published.record.outputSha256,
+                  let after = try? LocalFileIdentity.inspect(fd: fd), after.isSameFile(as: before),
+                  let entry = try? LocalFileIdentity.inspect(dirFD: dirFD, name: published.finalFileName),
+                  entry.isSameFile(as: before) else {
+                return nil
+            }
+            return entry
+        }
 
         func verifyFinalUnchanged() throws {
+            if parentIsWebDAV {
+                // Server-refreshed metadata first: the stat below must not come from a stale inode cache.
+                guard enumerateDirectoryRefreshingMetadata(dirFD: dirFD, expecting: published.finalFileName) else {
+                    throw conversionError(30, "MP4 폴더 목록을 확인하지 못해 서버 기준 시각을 알 수 없습니다 (원본은 보존됨).")
+                }
+            }
             let current = try LocalFileIdentity.inspect(dirFD: dirFD, name: published.finalFileName)
-            guard current == published.identity else {
-                throw conversionError(25, "썸네일 생성 중 MP4 식별 정보가 변경되었습니다 (원본은 보존됨)")
+            if current != published.identity {
+                var steps = [describe("경로 stat", current)]
+                guard parentIsWebDAV else { throw mismatchError(steps) }
+                let observed = reopenObservations()
+                steps.append(describe("재열기 fd", observed.fd))
+                steps.append(describe("재열기 후 경로 stat", observed.entry))
+                if !observed.note.isEmpty { steps.append(observed.note) }
+                if !observed.matches {
+                    // NO-DELETE resume only: times-only difference of the same file (dev/inode/size) → content must be re-proven.
+                    guard resumeTolerance, current.isSameFile(as: published.identity),
+                          observed.fd.map({ $0.isSameFile(as: published.identity) }) ?? false,
+                          observed.entry.map({ $0.isSameFile(as: published.identity) }) ?? false else {
+                        throw mismatchError(steps)
+                    }
+                    guard resumedRefreshBudget > 0 else {
+                        steps.append("시각만 다른 상태가 계속되어 재확인 횟수를 모두 사용")
+                        throw mismatchError(steps)
+                    }
+                    resumedRefreshBudget -= 1
+                    guard let refreshed = try rehashedIdentity() else {
+                        steps.append("시각만 다른 상태에서 전체 SHA-256·크기 재확인에 실패")
+                        throw mismatchError(steps)
+                    }
+                    published = LocalPublishedMP4(finalFileName: published.finalFileName, identity: refreshed, record: published.record)
+                }
             }
             // The URL used by AVFoundation must resolve to the very same file.
             let probeFD = open(finalURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
@@ -1125,93 +1473,135 @@ enum LocalPublicationManager {
             }
         }
 
-        try verifyFinalUnchanged()
-        try Task.checkCancellation()
-
-        // Fresh metadata of the NEW MP4 (never the old source identity).
-        let values = try finalURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        guard let freshSize = values.fileSize, Int64(freshSize) == published.identity.size,
-              let freshMTime = values.contentModificationDate,
-              abs(Int64(freshMTime.timeIntervalSince1970 * 1000) - published.identity.mtimeNanoseconds / 1_000_000) <= 1 else {
-            throw conversionError(27, "MP4 최신 메타데이터 불일치 (원본은 보존됨)")
-        }
-        let thumbnailName = try NasFinderVaultCompatibility.thumbnailFilename(for: finalURL)
-        _ = try NASPathSecurity.checkedComponents([vaultDirName, thumbnailName])
-
-        // Vault directory, opened descriptor-relatively without following links.
-        if mkdirat(dirFD, vaultDirName, 0o755) != 0 && errno != EEXIST {
-            throw posixError(errno, "Vault 폴더 생성 실패 (원본은 보존됨)")
-        }
-        let vaultFD = openat(dirFD, vaultDirName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard vaultFD >= 0 else {
-            throw posixError(errno, "Vault 폴더 열기 실패 (원본은 보존됨)")
-        }
-        defer { Darwin.close(vaultFD) }
+        var vaultFD: Int32 = -1
+        defer { if vaultFD >= 0 { Darwin.close(vaultFD) } }
         var vaultStat = stat()
-        guard fstat(vaultFD, &vaultStat) == 0, (vaultStat.st_mode & S_IFMT) == S_IFDIR else {
-            throw conversionError(28, "Vault 폴더가 유효하지 않습니다 (원본은 보존됨)")
-        }
+        var cachedData: Data?
+        var lastDrift = "썸네일 키와 MP4 수정 시각이 맞지 않습니다"
 
-        var existing = stat()
-        if fstatat(vaultFD, thumbnailName, &existing, AT_SYMLINK_NOFOLLOW) != 0 {
-            guard errno == ENOENT else {
-                throw posixError(errno, "썸네일 항목 확인 실패 (원본은 보존됨)")
-            }
-            let data = try await VaultProcessor.videoThumbnailData(for: finalURL)
+        for round in 0..<resumeRounds {
+            let isLastRound = round == resumeRounds - 1
+            if round > 0 { usleep(300_000) }
             try Task.checkCancellation()
-            guard VaultProcessor.isValidJPEGThumbnail(data) else {
-                throw VaultProcessorError.cannotEncode
-            }
             try verifyFinalUnchanged()
 
-            let tempName = ".upload-\(UUID().uuidString).tmp"
-            let tmpFD = openat(vaultFD, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
-            guard tmpFD >= 0 else {
-                throw posixError(errno, "썸네일 임시 파일 생성 실패 (원본은 보존됨)")
+            // Fresh metadata of the NEW MP4 (never the old source identity). A fresh URL: no cached resource values.
+            let freshURL = URL(fileURLWithPath: finalURL.path)
+            let values = try freshURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            guard let freshSize = values.fileSize, Int64(freshSize) == published.identity.size,
+                  let freshMTime = values.contentModificationDate,
+                  abs(Int64(freshMTime.timeIntervalSince1970 * 1000) - published.identity.mtimeNanoseconds / 1_000_000) <= 1 else {
+                let freshText = values.contentModificationDate.map { String(Int64($0.timeIntervalSince1970 * 1000)) } ?? "없음"
+                let message = "MP4 최신 메타데이터 불일치 (원본은 보존됨): 기대 크기 \(published.identity.size)·mtime(ms) \(published.identity.mtimeNanoseconds / 1_000_000), 현재 크기 \(values.fileSize.map(String.init) ?? "없음")·mtime(ms) \(freshText)"
+                if resumeTolerance, !isLastRound { lastDrift = message; continue }
+                throw conversionError(27, message)
             }
-            var written = 0
-            var writeFailure: Error?
-            data.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else { return }
-                while written < raw.count {
-                    let res = Darwin.write(tmpFD, base.advanced(by: written), raw.count - written)
-                    if res <= 0 {
-                        writeFailure = posixError(errno, "썸네일 쓰기 실패")
-                        return
+            // The key comes from exactly the metadata just validated against the MP4 identity.
+            let keyedMillis = Int64(freshMTime.timeIntervalSince1970 * 1000)
+            let thumbnailName = NasFinderVaultCompatibility.thumbnailFilename(
+                name: freshURL.lastPathComponent, size: Int64(freshSize), modifiedAt: freshMTime
+            )
+            _ = try NASPathSecurity.checkedComponents([vaultDirName, thumbnailName])
+            /// Resume only: the MP4 identity moved after the key was derived → the key is recomputed in the next round.
+            func keyStillMatchesPublished() -> Bool {
+                abs(keyedMillis - published.identity.mtimeNanoseconds / 1_000_000) <= 1
+            }
+
+            // Vault directory, opened descriptor-relatively without following links.
+            if vaultFD < 0 {
+                if mkdirat(dirFD, vaultDirName, 0o755) != 0 && errno != EEXIST {
+                    throw posixError(errno, "Vault 폴더 생성 실패 (원본은 보존됨)")
+                }
+                vaultFD = openat(dirFD, vaultDirName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard vaultFD >= 0 else {
+                    throw posixError(errno, "Vault 폴더 열기 실패 (원본은 보존됨)")
+                }
+                guard fstat(vaultFD, &vaultStat) == 0, (vaultStat.st_mode & S_IFMT) == S_IFDIR else {
+                    throw conversionError(28, "Vault 폴더가 유효하지 않습니다 (원본은 보존됨)")
+                }
+            }
+
+            var existing = stat()
+            if fstatat(vaultFD, thumbnailName, &existing, AT_SYMLINK_NOFOLLOW) != 0 {
+                guard errno == ENOENT else {
+                    throw posixError(errno, "썸네일 항목 확인 실패 (원본은 보존됨)")
+                }
+                let data: Data
+                if let cachedData {
+                    data = cachedData
+                } else {
+                    let generated = try await VaultProcessor.videoThumbnailData(for: finalURL)
+                    try Task.checkCancellation()
+                    guard VaultProcessor.isValidJPEGThumbnail(generated) else {
+                        throw VaultProcessorError.cannotEncode
                     }
-                    written += res
+                    cachedData = generated
+                    data = generated
+                }
+                // Reading the MP4 may have refreshed its times: re-prove it (resume) and make sure the key still matches it.
+                try verifyFinalUnchanged()
+                if resumeTolerance, !keyStillMatchesPublished() {
+                    if isLastRound { throw mismatchError([lastDrift, "키 계산 후 MP4 수정 시각이 바뀌어 썸네일을 쓰지 않음"]) }
+                    lastDrift = "키 계산 후 MP4 수정 시각이 바뀜"
+                    continue
+                }
+
+                let tempName = ".upload-\(UUID().uuidString).tmp"
+                let tmpFD = openat(vaultFD, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
+                guard tmpFD >= 0 else {
+                    throw posixError(errno, "썸네일 임시 파일 생성 실패 (원본은 보존됨)")
+                }
+                var written = 0
+                var writeFailure: Error?
+                data.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    while written < raw.count {
+                        let res = Darwin.write(tmpFD, base.advanced(by: written), raw.count - written)
+                        if res <= 0 {
+                            writeFailure = posixError(errno, "썸네일 쓰기 실패")
+                            return
+                        }
+                        written += res
+                    }
+                }
+                if writeFailure == nil, !fullSync(tmpFD) {
+                    writeFailure = posixError(errno, "썸네일 sync 실패")
+                }
+                Darwin.close(tmpFD)
+                if let writeFailure {
+                    unlinkat(vaultFD, tempName, 0)
+                    throw writeFailure
+                }
+                if renameClaimed(vaultFD, tempName, thumbnailName) != 0 {
+                    let err = errno
+                    unlinkat(vaultFD, tempName, 0)
+                    // A concurrent client may have published the same key; it is validated below, never trusted.
+                    guard err == EEXIST else {
+                        throw posixError(err, "썸네일 배타적 발행 실패 (원본은 보존됨)")
+                    }
+                }
+                guard fullSync(vaultFD), fullSync(dirFD) else {
+                    throw posixError(errno, "썸네일 디렉터리 sync 실패 (원본은 보존됨)")
                 }
             }
-            if writeFailure == nil, !fullSync(tmpFD) {
-                writeFailure = posixError(errno, "썸네일 sync 실패")
+
+            let thumbnailIdentity = try readValidatedThumbnail(vaultFD: vaultFD, name: thumbnailName)
+            try verifyFinalUnchanged()
+            if resumeTolerance, !keyStillMatchesPublished() {
+                if isLastRound { throw mismatchError([lastDrift, "발행 후 MP4 수정 시각이 키와 달라져 마지막 키를 확정하지 못함 (썸네일은 보존)"]) }
+                lastDrift = "발행 후 MP4 수정 시각이 키와 달라짐"
+                continue
             }
-            Darwin.close(tmpFD)
-            if let writeFailure {
-                unlinkat(vaultFD, tempName, 0)
-                throw writeFailure
-            }
-            if renameClaimed(vaultFD, tempName, thumbnailName) != 0 {
-                let err = errno
-                unlinkat(vaultFD, tempName, 0)
-                // A concurrent client may have published the same key; it is validated below, never trusted.
-                guard err == EEXIST else {
-                    throw posixError(err, "썸네일 배타적 발행 실패 (원본은 보존됨)")
-                }
-            }
-            guard fullSync(vaultFD), fullSync(dirFD) else {
-                throw posixError(errno, "썸네일 디렉터리 sync 실패 (원본은 보존됨)")
-            }
+
+            return LocalPublishedThumbnail(
+                fileName: thumbnailName,
+                identity: thumbnailIdentity,
+                vaultDevice: vaultStat.st_dev,
+                vaultInode: vaultStat.st_ino,
+                mp4Identity: published.identity
+            )
         }
-
-        let thumbnailIdentity = try readValidatedThumbnail(vaultFD: vaultFD, name: thumbnailName)
-        try verifyFinalUnchanged()
-
-        return LocalPublishedThumbnail(
-            fileName: thumbnailName,
-            identity: thumbnailIdentity,
-            vaultDevice: vaultStat.st_dev,
-            vaultInode: vaultStat.st_ino
-        )
+        throw mismatchError([lastDrift])
     }
 
     /// Re-opens the thumbnail by exact name (no symlink), requires a regular nlink-1 nonempty file whose bytes
@@ -1259,6 +1649,12 @@ enum LocalPublicationManager {
         let originalFileName = sourceLock.fileName
         let stem = (originalFileName as NSString).deletingPathExtension
         let ext = (originalFileName as NSString).pathExtension
+        // The thumbnail was keyed from the (possibly server-refreshed) MP4 identity; it must be the very same file that was published
+        // (dev/inode/size), and deletion is checked against exactly that identity below.
+        guard thumbnail.mp4Identity.isSameFile(as: published.identity) else {
+            throw conversionError(52, "삭제 직전 MP4 식별 정보 변경 감지: 원본을 삭제하지 않습니다.")
+        }
+        let published = LocalPublishedMP4(finalFileName: published.finalFileName, identity: thumbnail.mp4Identity, record: published.record)
         guard !stem.isEmpty, !ext.isEmpty,
               ext.lowercased() != LocalConversionConstants.finalExtension,
               originalFileName != published.finalFileName,
@@ -1274,13 +1670,38 @@ enum LocalPublicationManager {
         // Last cancellation point: after the deletion journal is written no cancellation is honoured.
         try Task.checkCancellation()
 
+        /// WebDAV may briefly answer a path stat from its metadata cache; opening the regular file refreshes it.
+        /// Only on a webdav parent, at most 2 times: reopen the MP4 and require the FULL identity of both the fresh fd and
+        /// the directory entry to equal `published.identity`. This never adopts a new identity; any mismatch still fails.
+        func refreshedWebDAVFinalMatches() -> Bool {
+            var fs = statfs()
+            guard fstatfs(dirFD, &fs) == 0, withUnsafeBytes(of: fs.f_fstypename, { raw -> Bool in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
+                return String(cString: base) == "webdav"
+            }) else { return false }
+            for _ in 0..<2 {
+                // Real enumeration first so the stats below show the server's metadata (reads only).
+                _ = enumerateDirectoryRefreshingMetadata(dirFD: dirFD, expecting: published.finalFileName)
+                let fd = openat(dirFD, published.finalFileName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                guard fd >= 0 else { continue }
+                let fdIdentity = try? LocalFileIdentity.inspect(fd: fd)
+                Darwin.close(fd)
+                guard fdIdentity == published.identity else { continue }
+                if let entry = try? LocalFileIdentity.inspect(dirFD: dirFD, name: published.finalFileName),
+                   entry == published.identity {
+                    return true
+                }
+            }
+            return false
+        }
+
         // Recheck everything that can be rechecked without I/O ambiguity BEFORE the journal and unlink.
         func recheckAll() throws {
             try claim?.verifyClaimBeforeSourceDeletion()
             try verifyParentPinned()
 
             guard let finalIdentity = try? LocalFileIdentity.inspect(dirFD: dirFD, name: published.finalFileName),
-                  finalIdentity == published.identity else {
+                  finalIdentity == published.identity || refreshedWebDAVFinalMatches() else {
                 throw conversionError(52, "삭제 직전 MP4 식별 정보 변경 감지: 원본을 삭제하지 않습니다.")
             }
 
@@ -1341,18 +1762,119 @@ enum LocalPublicationManager {
         }
     }
 
-    private static func writeJournalRecord(
+    private static let journalRetryLimit = 4
+    private static let journalRetryDelayMicros: UInt32 = 250_000
+
+    private static func isTransientBusy(_ err: Int32) -> Bool {
+        err == EBUSY || err == EAGAIN || err == EINTR
+    }
+
+    /// dev/inode of the temp file this call created, taken from `fstat` on the successfully opened descriptor.
+    /// It is the only proof that a directory entry is this call's own file; a name alone proves nothing.
+    private struct OwnedTemp {
+        let dev: dev_t
+        let ino: ino_t
+    }
+
+    private enum TempEntryState {
+        case owned      // the entry at the name is a regular file with exactly the captured dev/inode
+        case absent     // positive ENOENT
+        case unproven   // anything else: another file, a replaced entry, or an error
+    }
+
+    private static func tempEntryState(_ dirFD: Int32, _ name: String, _ owned: OwnedTemp) -> TempEntryState {
+        var st = stat()
+        guard fstatat(dirFD, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+            return errno == ENOENT ? .absent : .unproven
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG, st.st_dev == owned.dev, st.st_ino == owned.ino else {
+            return .unproven
+        }
+        return .owned
+    }
+
+    /// Unlinks `name` only when it is still the exact inode this call created (rechecked immediately before).
+    /// Anything else, including an absent or replaced entry, is left untouched.
+    @discardableResult
+    private static func unlinkOwnedTemp(_ dirFD: Int32, _ name: String, _ owned: OwnedTemp) -> Bool {
+        guard tempEntryState(dirFD, name, owned) == .owned else { return false }
+        return unlinkat(dirFD, name, 0) == 0
+    }
+
+    /// True only when `name` is a regular single-link entry that is the captured temp inode (same dev/inode, so the
+    /// rename really moved our file) and whose bytes equal `expected` exactly. Opened without following links.
+    private static func journalTargetHolds(_ expected: Data, dirFD: Int32, name: String, owned: OwnedTemp) -> Bool {
+        let fd = openat(dirFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_nlink == 1,
+              st.st_dev == owned.dev, st.st_ino == owned.ino,
+              Int(st.st_size) == expected.count else { return false }
+        var bytes = [UInt8](repeating: 0, count: expected.count)
+        var total = 0
+        while total < bytes.count {
+            let n = bytes.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress! + total, $0.count - total) }
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return false }
+            total += n
+        }
+        var extra: UInt8 = 0
+        guard Darwin.read(fd, &extra, 1) == 0 else { return false }
+        var entry = stat()
+        guard fstatat(dirFD, name, &entry, AT_SYMLINK_NOFOLLOW) == 0,
+              entry.st_dev == st.st_dev, entry.st_ino == st.st_ino else { return false }
+        return Data(bytes) == expected
+    }
+
+    static func writeJournalRecord(
         _ record: LocalJournalRecord,
         fileName: String,
         dirFD: Int32
     ) throws {
         let data = try JSONEncoder().encode(record)
-        let tempName = "\(fileName).tmp-\(UUID().uuidString.lowercased())"
 
-        let fd = openat(dirFD, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else {
+        // Transient WebDAV/SMB busy results (EBUSY/EAGAIN/EINTR) get a small bounded retry. Every open attempt uses
+        // a fresh unique temp name. A failed `openat` proves nothing about what exists under that name (the create
+        // may or may not have happened), so such an entry is NEVER removed; it is preserved as evidence.
+        var tempName = ""
+        var fd: Int32 = -1
+        var openAttempt = 0
+        while true {
+            tempName = "\(fileName).tmp-\(UUID().uuidString.lowercased())"
+            fd = openat(dirFD, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            if fd >= 0 { break }
             let err = errno
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 임시 파일 생성 실패 (errno \(err))"])
+            guard isTransientBusy(err), openAttempt < journalRetryLimit else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 임시 파일 생성 실패 (errno \(err)): 생성 여부를 확인할 수 없는 임시 항목은 삭제하지 않고 보존합니다"])
+            }
+            openAttempt += 1
+            try Task.checkCancellation()
+            usleep(journalRetryDelayMicros * UInt32(openAttempt))
+        }
+
+        // From here the file is provably ours: bind its identity to the descriptor that created it.
+        var createdStat = stat()
+        guard fstat(fd, &createdStat) == 0, (createdStat.st_mode & S_IFMT) == S_IFREG else {
+            let err = errno
+            Darwin.close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 임시 파일 식별 실패 (errno \(err)): 소유를 증명하지 못한 임시 항목은 삭제하지 않고 보존합니다"])
+        }
+        let owned = OwnedTemp(dev: createdStat.st_dev, ino: createdStat.st_ino)
+        var fdOpen = true
+        func closeTempFD() {
+            if fdOpen {
+                fdOpen = false
+                Darwin.close(fd)
+            }
+        }
+
+        do {
+            try Task.checkCancellation()
+        } catch {
+            closeTempFD()
+            unlinkOwnedTemp(dirFD, tempName, owned)
+            throw error
         }
 
         var written = 0
@@ -1360,6 +1882,7 @@ enum LocalPublicationManager {
             guard let base = raw.baseAddress else { return nil }
             while written < raw.count {
                 let res = Darwin.write(fd, base.advanced(by: written), raw.count - written)
+                if res < 0 && errno == EINTR { continue }
                 if res <= 0 {
                     let err = errno
                     return NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 쓰기 실패 (errno \(err))"])
@@ -1370,29 +1893,62 @@ enum LocalPublicationManager {
         }
 
         if let writeError {
-            Darwin.close(fd)
-            unlinkat(dirFD, tempName, 0)
+            closeTempFD()
+            unlinkOwnedTemp(dirFD, tempName, owned)
             throw writeError
         }
 
         guard written == data.count else {
-            Darwin.close(fd)
-            unlinkat(dirFD, tempName, 0)
+            closeTempFD()
+            unlinkOwnedTemp(dirFD, tempName, owned)
             throw NSError(domain: "LocalConversionError", code: 19, userInfo: [NSLocalizedDescriptionKey: "저널 쓰기 바이트 불일치"])
         }
 
         if fsync(fd) != 0 {
             let err = errno
-            Darwin.close(fd)
-            unlinkat(dirFD, tempName, 0)
+            closeTempFD()
+            unlinkOwnedTemp(dirFD, tempName, owned)
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 fsync 실패 (errno \(err))"])
         }
-        Darwin.close(fd)
+        closeTempFD()
 
-        if renameClaimed(dirFD, tempName, fileName) != 0 {
+        // Exclusive publication never overwrites. A transient busy result is retried with the same fsynced temp file,
+        // but only while the entry at the temp name is still the captured inode. If the rename actually took effect
+        // (temp name gone) it counts as published only when the target is that same inode (dev/inode) with exactly our
+        // bytes; otherwise nothing is removed and the artifacts stay for review.
+        var renameAttempt = 0
+        while true {
+            // Fresh cancellation and identity check immediately before every rename attempt, including after a retry sleep.
+            let preState = tempEntryState(dirFD, tempName, owned)
+            do {
+                try Task.checkCancellation()
+            } catch {
+                if preState == .owned { unlinkOwnedTemp(dirFD, tempName, owned) }
+                throw error
+            }
+            guard preState == .owned else {
+                throw NSError(domain: "LocalConversionError", code: 20, userInfo: [NSLocalizedDescriptionKey: "저널 배타적 발행 전 임시 항목 소유를 증명할 수 없어 관련 항목을 삭제하지 않고 보존합니다"])
+            }
+            if renameClaimed(dirFD, tempName, fileName) == 0 { break }
             let err = errno
-            unlinkat(dirFD, tempName, 0)
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 배타적 발행 실패 (errno \(err))"])
+            let tempState = tempEntryState(dirFD, tempName, owned)
+            if isTransientBusy(err), tempState == .absent,
+               journalTargetHolds(data, dirFD: dirFD, name: fileName, owned: owned) {
+                break
+            }
+            guard isTransientBusy(err), tempState == .owned, renameAttempt < journalRetryLimit else {
+                if tempState == .owned { unlinkOwnedTemp(dirFD, tempName, owned) }
+                let preserved = tempState == .owned ? "" : ": 소유를 증명할 수 없어 관련 항목을 삭제하지 않고 보존합니다"
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "저널 배타적 발행 실패 (errno \(err))\(preserved)"])
+            }
+            do {
+                try Task.checkCancellation()
+            } catch {
+                unlinkOwnedTemp(dirFD, tempName, owned)
+                throw error
+            }
+            renameAttempt += 1
+            usleep(journalRetryDelayMicros * UInt32(renameAttempt))
         }
 
         if fsync(dirFD) != 0 {
