@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import stat
+import statistics
 import struct
 import subprocess
 import sys
@@ -69,6 +70,7 @@ CLOCK_JUMP_SECONDS = 65.536  # 2^16 ms: the exact audio clock offset seen in dam
 CLOCK_STEP_TOLERANCE = 0.005  # a packet may start this far from the previous packet's end and still be "continuous"
 TIMELINE_TIMEOUT = 900  # ffprobe packet listing of one file (only run after a conversion already failed on timing)
 MAX_TIMELINE_BYTES = 128 * 1024 * 1024
+COVER_HASH_TIMEOUT = 120  # seconds to read one embedded cover picture packet
 PTS_DTS_SLACK = 0.001  # a recovered presentation time may not precede its own decoding time by more than this
 PROGRESS_INTERVAL = 1.0  # seconds between status writes while ffmpeg reports -progress
 PROGRESS_LINE_MAX = 256  # a longer line on ffmpeg's -progress pipe is never valid and is dropped
@@ -946,7 +948,7 @@ def probe_file(filepath: str, timeout: int = PROBE_TIMEOUT) -> Optional[Dict[str
     global current_process
     cmd = [
         FFPROBE, "-v", "error",
-        "-show_entries", "format=format_name,duration:stream=index,codec_name,codec_tag_string,profile,level,codec_type,duration,nb_frames,width,height,avg_frame_rate,r_frame_rate,time_base,sample_aspect_ratio,display_aspect_ratio,sample_rate,channels,color_space,color_transfer,color_primaries,pix_fmt,bits_per_raw_sample",
+        "-show_entries", "format=format_name,duration:stream=index,codec_name,codec_tag_string,profile,level,codec_type,duration,nb_frames,width,height,avg_frame_rate,r_frame_rate,time_base,sample_aspect_ratio,display_aspect_ratio,sample_rate,channels,color_space,color_transfer,color_primaries,pix_fmt,bits_per_raw_sample:stream_disposition=attached_pic",
         "-of", "json",
         filepath
     ]
@@ -980,6 +982,20 @@ def probe_file(filepath: str, timeout: int = PROBE_TIMEOUT) -> Optional[Dict[str
         terminate_current_process()
         current_process = None
         out_f.close()
+
+
+frame_timeline_failure = ""  # why the last probe_decoded_frame_timeline returned None ("" = timestamps missing/inconsistent)
+
+
+def timeline_expired(out_f: Any) -> Callable[[], Optional[str]]:
+    """Watchdog of one ffprobe listing written to out_f: "timeout" after TIMELINE_TIMEOUT seconds, "too_big" above MAX_TIMELINE_BYTES."""
+    deadline = time.monotonic() + TIMELINE_TIMEOUT
+
+    def check() -> Optional[str]:
+        if os.fstat(out_f.fileno()).st_size > MAX_TIMELINE_BYTES:
+            return "too_big"
+        return "timeout" if time.monotonic() > deadline else None
+    return check
 
 
 def duration_tolerance(duration: float) -> float:
@@ -1040,7 +1056,7 @@ def scan_packet_timeline(
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=subprocess.DEVNULL, start_new_session=True)
         current_process = proc
-        deadline = time.monotonic() + TIMELINE_TIMEOUT
+        expired = timeline_expired(out_f)
         while True:
             try:
                 proc.wait(timeout=0.25)
@@ -1048,7 +1064,7 @@ def scan_packet_timeline(
             except subprocess.TimeoutExpired:
                 pass
             check_incoming_stop()
-            if stop_requested or time.monotonic() > deadline or os.fstat(out_f.fileno()).st_size > MAX_TIMELINE_BYTES:
+            if stop_requested or expired():
                 terminate_current_process()
                 return None, None, {}
         if proc.returncode != 0 or os.fstat(out_f.fileno()).st_size > MAX_TIMELINE_BYTES:
@@ -1587,7 +1603,8 @@ def probe_decoded_frame_timeline(
     timestamps and durations for all decoded video frames, and the trustworthy first audio timestamp for each mapped
     audio stream. Missing/untrustworthy timestamps, unexpected stream identities, non-increasing PTS or incomplete counts
     fail closed (returns None)."""
-    global current_process
+    global current_process, frame_timeline_failure
+    frame_timeline_failure = ""
     entries = "frame=media_type,stream_index,pts_time,duration_time" + (",best_effort_timestamp_time,nb_samples" if coverage else "")
     cmd = [FFPROBE, "-v", "error", "-show_entries", entries, "-of", "compact=p=0", filepath]
     out_f = tempfile.TemporaryFile()
@@ -1596,7 +1613,7 @@ def probe_decoded_frame_timeline(
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f or subprocess.DEVNULL,
                                 start_new_session=True)
         current_process = proc
-        deadline = time.monotonic() + TIMELINE_TIMEOUT
+        expired = timeline_expired(out_f)
         while True:
             try:
                 proc.wait(timeout=0.25)
@@ -1604,16 +1621,25 @@ def probe_decoded_frame_timeline(
             except subprocess.TimeoutExpired:
                 pass
             check_incoming_stop()
-            if stop_requested or time.monotonic() > deadline or os.fstat(out_f.fileno()).st_size > MAX_TIMELINE_BYTES or (
-                    err_f is not None and os.fstat(err_f.fileno()).st_size > SOURCE_STDERR_MAX_BYTES):
+            limit = expired()
+            if stop_requested or limit or (err_f is not None and os.fstat(err_f.fileno()).st_size > SOURCE_STDERR_MAX_BYTES):
                 terminate_current_process()
+                if not stop_requested:
+                    frame_timeline_failure = (f"디코딩 오류 메시지가 {SOURCE_STDERR_MAX_BYTES}바이트를 넘음(파일 손상)" if not limit else
+                                              {"timeout": f"분석 시간 초과({TIMELINE_TIMEOUT}초)", "too_big": "분석 출력 한도 초과"}[limit])
                 return None
-        if proc.returncode != 0 or os.fstat(out_f.fileno()).st_size > MAX_TIMELINE_BYTES:
+        if os.fstat(out_f.fileno()).st_size > MAX_TIMELINE_BYTES:
+            frame_timeline_failure = "분석 출력 한도 초과"
+            return None
+        if proc.returncode != 0:
+            frame_timeline_failure = f"ffprobe 오류(종료 코드 {proc.returncode})"
             return None
         if err_f is not None and os.fstat(err_f.fileno()).st_size > SOURCE_STDERR_MAX_BYTES:
+            frame_timeline_failure = f"디코딩 오류 메시지가 {SOURCE_STDERR_MAX_BYTES}바이트를 넘음(파일 손상)"
             return None  # a stderr that outgrew the cap during the final poll interval is never a complete bounded record
         source_messages = err_f is not None and os.fstat(err_f.fileno()).st_size > 0
         if source_messages and not clock_recovery:
+            frame_timeline_failure = "디코딩 오류 발생(파일 손상)"
             return None  # rc 0 with decoding errors on stderr is not a clean full decode
         out_f.seek(0)
 
@@ -1621,6 +1647,7 @@ def probe_decoded_frame_timeline(
         a_set = set(expected_a_indices)
         other_set = set(allowed_other_indices or ())
         all_allowed = v_set | a_set | other_set
+        covers: Optional[Set[int]] = None
 
         video_pts: Dict[int, List[float]] = {idx: [] for idx in expected_v_indices}
         video_last_dur: Dict[int, float] = {}
@@ -1665,6 +1692,11 @@ def probe_decoded_frame_timeline(
                     return None
 
             if s_idx not in all_allowed:
+                if covers is None:  # only a stream nobody listed gets this lookup: embedded cover pictures are no timed video
+                    covers = {c["index"] for c in (probe_file(filepath) or {}).get("streams", [])
+                              if isinstance(c, dict) and is_cover_art(c) and isinstance(c.get("index"), int)}
+                if s_idx in covers:
+                    continue  # their bytes are verified separately (cover_art_problem); they never enter the frame comparison
                 return None
 
             if s_idx in v_set:
@@ -1845,14 +1877,14 @@ def verify_decoded_presentation_match(
         if stop_requested:
             return "작업 중지 요청됨"
         if not s_probe:
-            return "원본 디코딩 프레임 시간축 분석 실패 (시간 초과·출력 한도·ffprobe 오류 또는 타임스탬프 누락)"
+            return f"원본 디코딩 프레임 시간축 분석 실패 ({frame_timeline_failure or '타임스탬프 누락·불일치'})"
         o_probe = probe_decoded_frame_timeline(
             out_path, out_v_indices, out_a_indices, allowed_other_out, coverage=True
         )
         if stop_requested:
             return "작업 중지 요청됨"
         if not o_probe:
-            return "결과 파일 디코딩 프레임 시간축 분석 실패 (시간 초과·출력 한도·ffprobe 오류 또는 타임스탬프 누락)"
+            return f"결과 파일 디코딩 프레임 시간축 분석 실패 ({frame_timeline_failure or '타임스탬프 누락·불일치'})"
 
     # Validate each mapped video stream separately in decoded presentation order
     for idx, sv in enumerate(video_streams):
@@ -1905,6 +1937,15 @@ def verify_decoded_presentation_match(
             return f"비디오 스트림 #{idx} 결과 마지막 프레임 표시 기간 정보가 유효하지 않습니다"
 
         frame_period = float(Fraction(1, 1) / s_fps)
+        if parse_rational(sv.get("avg_frame_rate")) is None and parse_rational(sv.get("r_frame_rate")) == 1 / s_tb:
+            # No average rate and r_frame_rate is just the inverse timebase (ASF/WMV 1000/1 on 1/1000): the nominal clock and the
+            # last frame's duration are one tick, so the end uncertainty is the stream's measured cadence. Only with identical
+            # frame counts (checked above) and a stable measured cadence; otherwise the strict nominal tolerance stays.
+            gaps = [b - a for a, b in zip(s_v[-10:], s_v[-9:])]
+            if len(gaps) >= 3 and all(g > 0 for g in gaps):
+                med = statistics.median(gaps)
+                if all(abs(g - med) <= med * 0.35 for g in gaps):
+                    frame_period = max(frame_period, med)
         # Tail tolerance: PTS tolerance + at most 1 frame duration container muxing quantization + timebase precision
         max_tail_tol = max_pts_tol + frame_period + s_precision + o_precision
 
@@ -2003,7 +2044,7 @@ def decoded_coverage_fallback(
     if stop_requested:
         return None, "작업 중지 요청됨", None
     if not s_probe:
-        return None, "원본 전체 디코딩 시간축을 확인할 수 없습니다(디코딩 오류·시간 초과·출력 한도·타임스탬프 누락)", None
+        return None, f"원본 전체 디코딩 시간축을 확인할 수 없습니다({frame_timeline_failure or '타임스탬프 누락·불일치'})", None
     if clock_recovery:  # the source must reproduce EXACTLY the inferred model of the plan (same frames, missing count, step)
         model = s_probe.get("avi_half_clock")
         if avi_plan != (model is not None) or (model is not None and recovery_plan is not None and (
@@ -2016,7 +2057,7 @@ def decoded_coverage_fallback(
     if stop_requested:
         return None, "작업 중지 요청됨", None
     if not o_probe:
-        return None, "결과 파일 전체 디코딩 시간축을 확인할 수 없습니다", None
+        return None, f"결과 파일 전체 디코딩 시간축을 확인할 수 없습니다({frame_timeline_failure or '타임스탬프 누락·불일치'})", None
 
     problem = verify_decoded_presentation_match(
         source_path, out_path, video_streams, out_v_streams, audio_streams, out_a_streams, probes=(s_probe, o_probe))
@@ -2309,7 +2350,7 @@ def output_policy_problem(out_streams: List[Dict[str, Any]]) -> Optional[str]:
     for s in out_streams:
         ctype = s.get("codec_type")
         if ctype == "video":
-            problem = h264_policy_problem(s, require_avc1=True)
+            problem = None if is_cover_art(s) else h264_policy_problem(s, require_avc1=True)
         elif ctype == "audio":
             problem = aac_lc_problem(s, require_mp4a=True)
         elif ctype == "subtitle":
@@ -2354,6 +2395,58 @@ def sample_aspect(stream: Dict[str, Any]) -> Fraction:
     return parse_rational(stream.get("sample_aspect_ratio")) or Fraction(1)
 
 
+def is_cover_art(s: Dict[str, Any]) -> bool:
+    """Embedded cover picture (ffprobe lists it as a video stream with disposition attached_pic); not a playable video."""
+    d = s.get("disposition")
+    return s.get("codec_type") == "video" and isinstance(d, dict) and d.get("attached_pic") == 1
+
+
+def cover_packet_hash(path: str, idx: int) -> Optional[str]:
+    """SHA-256 of the first (only) packet of one attached-picture stream, read with -c copy so nothing is decoded; cancellable and
+    time-bounded. None when it cannot be read."""
+    global current_process
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-i", path, "-map", f"0:{idx}", "-c", "copy", "-frames:v", "1",
+           "-f", "hash", "-hash", "sha256", "-"]
+    with tempfile.TemporaryFile() as out_f:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=subprocess.DEVNULL, start_new_session=True)
+        current_process = proc
+        try:
+            deadline = time.monotonic() + COVER_HASH_TIMEOUT
+            while True:
+                try:
+                    proc.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                check_incoming_stop()
+                if stop_requested or time.monotonic() > deadline:
+                    terminate_current_process()
+                    return None
+            out_f.seek(0)
+            m = re.fullmatch(r"SHA256=([0-9a-f]{64})\s*", out_f.read(256).decode("ascii", "replace"))
+            return m.group(1) if proc.returncode == 0 and m else None
+        finally:
+            terminate_current_process()
+            current_process = None
+
+
+def cover_art_problem(source_path: str, out_path: str, src_covers: List[Dict[str, Any]], out_covers: List[Dict[str, Any]]) -> Optional[str]:
+    """Every source cover picture must be in the output unchanged: same count, codec, size and identical packet bytes."""
+    if len(src_covers) != len(out_covers):
+        return f"첨부 커버 이미지 수 불일치 (원본: {len(src_covers)}, 생성: {len(out_covers)})"
+    for n, (sc, oc) in enumerate(zip(src_covers, out_covers), start=1):
+        if (sc.get("codec_name"), sc.get("width"), sc.get("height")) != (oc.get("codec_name"), oc.get("width"), oc.get("height")):
+            return f"첨부 커버 이미지 {n} 형식·크기 불일치 (원본: {sc.get('codec_name')} {sc.get('width')}x{sc.get('height')}, 생성: {oc.get('codec_name')} {oc.get('width')}x{oc.get('height')})"
+        if not isinstance(sc.get("index"), int) or not isinstance(oc.get("index"), int):
+            return f"첨부 커버 이미지 {n} 스트림 정보가 올바르지 않습니다"
+        s_hash, o_hash = cover_packet_hash(source_path, sc["index"]), cover_packet_hash(out_path, oc["index"])
+        if stop_requested:
+            return "작업 중지 요청됨"
+        if s_hash is None or s_hash != o_hash:
+            return f"첨부 커버 이미지 {n} 내용이 원본과 일치하지 않거나 확인할 수 없습니다"
+    return None
+
+
 def video_metadata_ok(sv: Dict[str, Any]) -> bool:
     """Size, frame rate, aspect and time base must all be present and sane (fail closed otherwise)."""
     return (isinstance(sv.get("width"), int) and isinstance(sv.get("height"), int)
@@ -2377,7 +2470,7 @@ def plan_from_probe(
         raise ValueError("원본 파일의 재생 시간 정보가 유효하지 않아 변환을 건너뜁니다.")
 
     streams = [s for s in src_probe["streams"] if isinstance(s, dict)]
-    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    video_streams = [s for s in streams if s.get("codec_type") == "video" and not is_cover_art(s)]
     audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
     subtitle_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
 
@@ -2410,7 +2503,7 @@ def classify_mp4(path: str) -> Tuple[str, str]:
         return "unverified", "ffprobe로 분석하지 못했거나 시간이 초과되었습니다"
     fmt = probe.get("format") if isinstance(probe.get("format"), dict) else {}
     streams = [s for s in probe["streams"] if isinstance(s, dict)]
-    video = [s for s in streams if s.get("codec_type") == "video"]
+    video = [s for s in streams if s.get("codec_type") == "video" and not is_cover_art(s)]
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     if not video or parse_duration(fmt) is None or not all(video_metadata_ok(s) for s in video):
         return "unverified", "영상 스트림, 재생 시간 또는 해상도·프레임레이트 정보를 확인할 수 없습니다"
@@ -2453,9 +2546,11 @@ def verify_output(
     out_path: str, src_duration: float, video_streams: List[Dict[str, Any]], audio_streams: List[Dict[str, Any]],
     subtitle_streams: List[Dict[str, Any]], tag: str, begin: Callable[..., Optional[Callable[[float], None]]],
     source_path: Optional[str] = None, corr: Optional[Dict[str, Any]] = None, source_is_avi: bool = False,
-    clock_recovery: bool = False, recovery_plan: Optional[Dict[str, Any]] = None
+    clock_recovery: bool = False, recovery_plan: Optional[Dict[str, Any]] = None,
+    src_covers: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[Optional[str], bool, List[Dict[str, Any]], List[Dict[str, Any]], float]:
-    """recovery_plan = the plan_clock_recovery plan, forwarded so the comparison reproduces the plan's exact inferred model.
+    """src_covers = the source's attached-picture streams (is_cover_art); they must reappear unchanged in the output (cover_art_problem).
+    recovery_plan = the plan_clock_recovery plan, forwarded so the comparison reproduces the plan's exact inferred model.
     clock_recovery=True (only the recovery attempt of the local Mac engine, needs source_path) additionally always runs the
     full decoded comparison against the source's REPAIRED clock (decoded_coverage_fallback with clock_recovery).
     corr (optional out-param): set to {"src_duration", "note"} when a stale source header duration was proven wrong by a
@@ -2480,7 +2575,7 @@ def verify_output(
     if out_duration is None:
         return bad("생성된 파일의 재생 시간 정보가 유효하지 않습니다.")
 
-    out_v_streams = [s for s in out_probe["streams"] if s.get("codec_type") == "video"]
+    out_v_streams = [s for s in out_probe["streams"] if s.get("codec_type") == "video" and not is_cover_art(s)]
     out_a_streams = [s for s in out_probe["streams"] if s.get("codec_type") == "audio"]
     out_s_streams = [s for s in out_probe["streams"] if s.get("codec_type") == "subtitle"]
 
@@ -2513,6 +2608,14 @@ def verify_output(
 
     if len(out_s_streams) != len(subtitle_streams):
         return bad(f"자막 스트림 수 불일치 (원본: {len(subtitle_streams)}, 생성: {len(out_s_streams)})")
+
+    out_covers = [s for s in out_probe["streams"] if is_cover_art(s)]
+    if source_path:
+        cover_problem = cover_art_problem(source_path, out_path, src_covers or [], out_covers)
+        if cover_problem:
+            return bad(cover_problem)
+    elif out_covers:
+        return bad("원본 정보 없이 첨부 커버 이미지를 확인할 수 없습니다")
 
     # Detailed codec policy: legacy video/audio (mpeg4, MP3, AC-3 ...) is rejected even though ffmpeg can decode it
     problem = output_policy_problem(out_probe["streams"])
@@ -2570,7 +2673,7 @@ def verify_output(
     decode_cmd = [
         FFMPEG, "-nostdin", "-v", "error", "-xerror", "-progress", "pipe:1", "-nostats",
         "-i", out_path,
-        "-map", "0:v", "-map", "0:a?",
+        "-map", "0:V", "-map", "0:a?",
         # Preserve the input MP4 timestamp precision so the verifier does not re-encode
         # timestamps onto a 1/framerate grid (decoder errors are still reported, not suppressed)
         "-fps_mode:v", "passthrough", "-enc_time_base:v", "demux",
@@ -2650,10 +2753,11 @@ def verify_external_source(
         src_duration, video_streams, audio_streams, subtitle_streams, _, _, _ = plan_from_probe(src_probe)
     except ValueError as e:
         return False, str(e), {}
+    src_covers = [s for s in src_probe["streams"] if is_cover_art(s)]
     corr: Dict[str, Any] = {}
     problem, _, out_v_streams, out_a_streams, out_duration = verify_output(
         out_path, src_duration, video_streams, audio_streams, subtitle_streams, "후보 파일", begin, source_path=source_path,
-        corr=corr, source_is_avi=is_avi_source(src_probe))
+        corr=corr, source_is_avi=is_avi_source(src_probe), src_covers=src_covers)
     if problem:
         return False, problem, {}
     if corr:  # stale header proven wrong by the full decoded comparison: all later timeline checks use the actual length
@@ -3051,6 +3155,13 @@ def convert_and_verify_source(
     except ValueError as e:
         return False, str(e)
 
+    # Embedded cover pictures are not video: they are copied unchanged as attached pictures after the real streams
+    src_covers = [s for s in src_probe["streams"] if is_cover_art(s)]
+    cover_idx = [s["index"] for s in src_covers if isinstance(s.get("index"), int)]
+    cover_args: List[str] = []
+    for n, idx in enumerate(cover_idx, start=len(video_streams)):
+        cover_args += ["-map", f"0:{idx}", f"-c:v:{n}", "copy", f"-disposition:v:{n}", "attached_pic"]
+
     timing_symptom = False  # set when an attempt failed in a way a timestamp diagnostic may explain
     header_note = ""  # set when a stale source header duration was corrected from the fully decoded content
 
@@ -3075,8 +3186,8 @@ def convert_and_verify_source(
             # recovery only: keep the source's own positive first timestamps (video 0.033 / audio 0.831); without -copyts ffmpeg
             # subtracts the declared 0.746 start, the first video time goes negative and the MP4 edit list trims early frames
             + (["-copyts"] if recovery else []) + ["-i", source_path,
-             "-map", "0:v", "-map", "0:a?", "-map", "0:s?",
-             "-map_metadata", "0", "-map_chapters", "0"]
+             "-map", "0:V", "-map", "0:a?", "-map", "0:s?"] + cover_args
+            + ["-map_metadata", "0", "-map_chapters", "0"]
             + args
             # AVI half-cadence / clean-clock decoder-message recovery only: +delay_moov writes the audio start from the real first packet, so the MP4 carries no
             # edit-list/discard that cuts the audio when the audio and video start offsets differ (all samples of every copied AAC packet stay audible)
@@ -3111,7 +3222,8 @@ def convert_and_verify_source(
         corr: Dict[str, Any] = {}
         problem, symptom, out_v_streams, out_a_streams, _ = verify_output(
             temp_path, src_duration, video_streams, audio_streams, subtitle_streams, tag, begin, source_path=source_path,
-            corr=corr, source_is_avi=is_avi_source(src_probe), clock_recovery=recovery is not None, recovery_plan=recovery)
+            corr=corr, source_is_avi=is_avi_source(src_probe), clock_recovery=recovery is not None, recovery_plan=recovery,
+            src_covers=src_covers)
         if problem:
             timing_symptom = timing_symptom or symptom
             return discard(problem)

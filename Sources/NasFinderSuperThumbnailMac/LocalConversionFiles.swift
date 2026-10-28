@@ -1014,14 +1014,14 @@ enum LocalPublicationManager {
 
         var copyError: Error? = nil
         do {
-            let engineHandle = try FileHandle(forReadingFrom: engineOutputURL)
+            let engineHandle = try withFileErrorPhase("엔진 출력 스테이징 복사용 열기") { try FileHandle(forReadingFrom: engineOutputURL) }
             defer { try? engineHandle.close() }
 
             var hasher = SHA256()
             var totalBytes: Int64 = 0
             var lastReportedCopyPercent = -1
             while true {
-                let chunk = try engineHandle.read(upToCount: 512 * 1024) ?? Data()
+                let chunk = try withFileErrorPhase("엔진 출력 스테이징 복사 읽기") { try engineHandle.read(upToCount: 512 * 1024) } ?? Data()
                 if chunk.isEmpty { break }
                 hasher.update(data: chunk)
                 totalBytes += Int64(chunk.count)

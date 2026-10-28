@@ -748,7 +748,7 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
             throw NASEngineExecutionError.outputVerificationFailed("엔진 출력 파일이 존재하지 않습니다: \(outputURL.path)")
         }
 
-        let values = try outputURL.resourceValues(forKeys: [.fileSizeKey])
+        let values = try withFileErrorPhase("엔진 출력 크기 확인") { try outputURL.resourceValues(forKeys: [.fileSizeKey]) }
         let actualSize = Int64(values.fileSize ?? 0)
 
         guard let outputSummary = result.output, outputSummary.size == actualSize else {
@@ -756,7 +756,7 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
         }
 
         // Verify SHA-256 of generated output
-        let handle = try FileHandle(forReadingFrom: outputURL)
+        let handle = try withFileErrorPhase("엔진 출력 SHA-256 검증용 열기") { try FileHandle(forReadingFrom: outputURL) }
         defer { try? handle.close() }
         var hasher = SHA256()
         while true {
@@ -795,5 +795,25 @@ final class DefaultNASConversionEngineBridge: NASConversionEngineBridging {
         for runner in runners {
             runner.terminate()
         }
+    }
+}
+
+
+/// Runs a local file operation; a failure keeps its plain message and appends the phase plus NSError domain/code and the
+/// underlying error chain (e.g. a bare "파일을 열 수 없습니다." is NSCocoaErrorDomain 256 over a POSIX errno), so the failing site is identifiable.
+func withFileErrorPhase<T>(_ phase: String, _ body: () throws -> T) throws -> T {
+    do {
+        return try body()
+    } catch let error as NSError {
+        var chain = ["\(error.domain) \(error.code)"]
+        var underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
+        while let u = underlying, chain.count < 4 {
+            chain.append("\(u.domain) \(u.code)")
+            underlying = u.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        var info = error.userInfo
+        info[NSLocalizedDescriptionKey] = "\(error.localizedDescription) [진단: \(phase), \(chain.joined(separator: " ← "))]"
+        info[NSUnderlyingErrorKey] = error
+        throw NSError(domain: error.domain, code: error.code, userInfo: info)
     }
 }
