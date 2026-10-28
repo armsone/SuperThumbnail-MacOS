@@ -551,6 +551,65 @@ final class LocalTimestampDriftRecoveryTests: XCTestCase {
         return (dir, lock, claim)
     }
 
+    // MARK: initial (pre-copy) time-only mismatch on the second attempt
+
+    private func identity(size: Int64 = 4096, ino: UInt64 = 7, dev: Int32 = 1, mtime: Int = 1_345_683_439, ctime: Int = 1_345_683_439) -> LocalFileIdentity {
+        LocalFileIdentity(device: dev_t(dev), inode: ino_t(ino), size: size, mtime: time_t(mtime), ctime: time_t(ctime))
+    }
+
+    func testInitialDecisionOnlySecondWebDAVTimeOnlyAttemptContinuesWithProof() {
+        let expected = identity()
+        let flipped = identity(mtime: driftTime, ctime: driftTime)
+        typealias W = LocalConversionWorker
+        func decide(_ locked: LocalFileIdentity, web: Bool = true, refresh: Bool, resume: Bool = false) -> W.InitialIdentityDecision {
+            W.initialIdentityDecision(locked: locked, expected: expected, isWebDAV: web, allowIdentityRefresh: refresh, isPublishedResume: resume)
+        }
+        XCTAssertEqual(decide(expected, refresh: false), .exact)
+        XCTAssertEqual(decide(flipped, refresh: true), .refresh)
+        XCTAssertEqual(decide(flipped, refresh: false), .provenRetainedAttempt)
+        // Blocked: non-WebDAV, size/inode/device changed (even with refresh).
+        XCTAssertEqual(decide(flipped, web: false, refresh: false), .skip)
+        XCTAssertEqual(decide(identity(size: 4097, mtime: driftTime, ctime: driftTime), refresh: false), .skip)
+        XCTAssertEqual(decide(identity(ino: 8, mtime: driftTime, ctime: driftTime), refresh: false), .skip)
+        XCTAssertEqual(decide(identity(dev: 2, mtime: driftTime, ctime: driftTime), refresh: false), .skip)
+        // Published resume keeps its own existing churn rule; unchanged.
+        XCTAssertEqual(decide(flipped, refresh: false, resume: true), .resumeKeepsTimeChurn)
+        // The proof is required for the initial drift even when the times match again after the copy.
+        XCTAssertTrue(W.requiresSourceContentProof(timesChangedDuringCopy: false, initialTimestampDrift: true))
+        XCTAssertTrue(W.requiresSourceContentProof(timesChangedDuringCopy: true, initialTimestampDrift: false))
+        XCTAssertFalse(W.requiresSourceContentProof(timesChangedDuringCopy: false, initialTimestampDrift: false))
+    }
+
+    func testInitialTimeOnlyPathProofRetainsOriginalEvenIfTimesMatchAgain() throws {
+        // The lock (opened with the flipped times) is the identity of this attempt; the expected one differed only in times.
+        setTimes("clip.avi", driftTime)
+        let (lock, claim) = try lockAndClaim()
+        XCTAssertTrue(lock.identity.isTimestampOnlyDrift(from: identity(size: Int64(sourceBytes.count), ino: UInt64(lock.identity.inode), dev: Int32(lock.identity.device))))
+        let sha = sha256(sourceBytes)
+        let proof = try prove(lock, claim)
+        XCTAssertTrue(proof.isBound(to: lock, claim: claim, attemptID: attemptID, sourceSha256: sha))
+        // Times match the lock again afterwards: the proof still makes the attempt retained-only.
+        let published = try publish(lock, claim, sha: sha, proof: proof)
+        XCTAssertEqual(published.record.retainedOriginalReason, .sourceTimestampOnlyDrift)
+        XCTAssertEqual(try readJournal("published").retainedOriginalReason, .sourceTimestampOnlyDrift)
+        try assertOriginalUntouched()
+    }
+
+    func testInitialTimeOnlyPathStaysBlockedWithoutValidProof() throws {
+        setTimes("clip.avi", driftTime)
+        let (lock, claim) = try lockAndClaim()
+        // Content mismatch.
+        XCTAssertThrowsError(try prove(lock, claim, sha: sha256(Data("other".utf8)))) { XCTAssertEqual(($0 as NSError).code, 74) }
+        // Non-WebDAV.
+        XCTAssertThrowsError(try prove(lock, claim, assumeWebDAV: false)) { XCTAssertEqual(($0 as NSError).code, 71) }
+        // Size change.
+        let handle = try FileHandle(forWritingTo: path("clip.avi"))
+        try handle.seekToEnd(); try handle.write(contentsOf: Data([1])); try handle.close()
+        XCTAssertThrowsError(try prove(lock, claim)) { XCTAssertEqual(($0 as NSError).code, 72) }
+        XCTAssertNil(try? publish(lock, claim, sha: sha256(sourceBytes), proof: nil))
+        XCTAssertFalse(try names().contains("clip.mp4"))
+    }
+
     private func setTimes2(_ dir: URL, _ name: String, _ seconds: Int) {
         var times = [timeval(tv_sec: seconds, tv_usec: 0), timeval(tv_sec: seconds, tv_usec: 0)]
         XCTAssertEqual(utimes(dir.appendingPathComponent(name).path, &times), 0)

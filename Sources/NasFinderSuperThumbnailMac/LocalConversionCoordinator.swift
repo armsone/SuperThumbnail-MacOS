@@ -313,10 +313,41 @@ enum LocalConversionWorker {
         return name == "webdav"
     }
 
+    /// Outcome of the open-time identity comparison (pure, no I/O).
+    enum InitialIdentityDecision: Equatable {
+        case exact
+        case resumeKeepsTimeChurn
+        /// First attempt, webdav, only mtime/ctime differ: one whole new attempt with the refreshed identity.
+        case refresh
+        /// Second attempt, webdav, same dev/inode/size, only mtime/ctime differ: continue ONLY with a forced full content proof
+        /// on the same descriptor (retained-only, original never deleted).
+        case provenRetainedAttempt
+        case skip
+    }
+
+    nonisolated static func initialIdentityDecision(
+        locked: LocalFileIdentity, expected: LocalFileIdentity, isWebDAV: Bool,
+        allowIdentityRefresh: Bool, isPublishedResume: Bool
+    ) -> InitialIdentityDecision {
+        if locked == expected { return .exact }
+        // NO-DELETE resume of an already published MP4: only dev/inode/size bind it (the exact journal is re-proven later).
+        if isPublishedResume && isWebDAV && locked.isSameFile(as: expected) { return .resumeKeepsTimeChurn }
+        guard isWebDAV, locked.isTimestampOnlyDrift(from: expected) else { return .skip }
+        return allowIdentityRefresh ? .refresh : .provenRetainedAttempt
+    }
+
+    /// The full SHA-256 re-read of the locked descriptor is required when the times moved during the copy OR the attempt
+    /// started from an initial time-only mismatch (a later matching time never replaces the proof).
+    nonisolated static func requiresSourceContentProof(timesChangedDuringCopy: Bool, initialTimestampDrift: Bool) -> Bool {
+        timesChangedDuringCopy || initialTimestampDrift
+    }
+
     /// WebDAV can serve cached mtime/ctime that differ from the listing. When the open (before any copy) finds ONLY that
     /// (same dev/inode/size), the attempt is cleaned up completely (claim released, fds closed, workspace removed, download
     /// slot freed) and exactly ONE new whole attempt runs with a fresh descriptor, attempt ID, claim, and hash, pinned to the
-    /// refreshed identity. Times that change AFTER the copy are never re-downloaded: the same locked descriptor is re-hashed
+    /// refreshed identity. If that second open still shows only a time difference (same dev/inode/size, webdav), the attempt
+    /// copies from the same locked descriptor but MUST pass the full SHA-256 proof before the engine and stays retained-only.
+    /// Times that change AFTER the copy are never re-downloaded: the same locked descriptor is re-hashed
     /// (`proveSourceTimestampDrift`) and the validated copy continues as a retained-only attempt (original never deleted).
     nonisolated static func performConversion(
         context: LocalAttemptContext,
@@ -503,13 +534,21 @@ enum LocalConversionWorker {
         // NO-DELETE resume of an already published MP4: the original is never changed or deleted here, and a webdav mount may show
         // other mtime/ctime for the same file at every enumeration or open. Only dev/inode/size bind it (and the exact journal is
         // re-proven below); no refresh retry, no skip for time-only differences. Any other difference still skips.
-        let resumeKeepsTimeChurn = context.publishedResume != nil && isWebDAV(fd: lock.fd)
-            && lock.identity.isSameFile(as: context.expectedIdentity)
-        guard lock.identity == context.expectedIdentity || resumeKeepsTimeChurn else {
-            if allowIdentityRefresh, isWebDAV(fd: lock.fd),
-               lock.identity.isTimestampOnlyDrift(from: context.expectedIdentity) {
-                return .identityRefresh(lock.identity)
-            }
+        let identityDecision = initialIdentityDecision(
+            locked: lock.identity, expected: context.expectedIdentity, isWebDAV: isWebDAV(fd: lock.fd),
+            allowIdentityRefresh: allowIdentityRefresh, isPublishedResume: context.publishedResume != nil
+        )
+        var initialTimestampDrift = false
+        switch identityDecision {
+        case .exact, .resumeKeepsTimeChurn:
+            break
+        case .refresh:
+            return .identityRefresh(lock.identity)
+        case .provenRetainedAttempt:
+            // Second attempt, still only mtime/ctime: this attempt copies from the same locked descriptor but MUST pass the
+            // full content proof below before the engine, and is retained-only. Claim and copy use the current lock.identity.
+            initialTimestampDrift = true
+        case .skip:
             let diff = lock.identity.differences(from: context.expectedIdentity).joined(separator: ", ")
             return .skipped(message: "파일 식별 정보가 목록 조회 시점과 달라 건너뜁니다(원본 유지): \(diff)")
         }
@@ -675,7 +714,9 @@ enum LocalConversionWorker {
 
                 let timesChanged = postCopyIdentity != expectedIdentity
                 // Times moved: the source is read once more below, so the download is not announced as complete yet.
-                if !timesChanged { onProgress(1, "다운로드 완료 · 인코딩 대기") }
+                if !requiresSourceContentProof(timesChangedDuringCopy: timesChanged, initialTimestampDrift: initialTimestampDrift) {
+                    onProgress(1, "다운로드 완료 · 인코딩 대기")
+                }
                 return (sha, copied, timesChanged)
             }()
 
@@ -683,7 +724,7 @@ enum LocalConversionWorker {
             // slot is still held, this reads the NAS again) and require the full SHA-256 of the copy. Success only makes this a
             // retained-only attempt; every mismatch, error, cancellation or ownership change throws with the original untouched.
             var driftProof: LocalSourceDriftProof?
-            if timesChangedDuringCopy {
+            if requiresSourceContentProof(timesChangedDuringCopy: timesChangedDuringCopy, initialTimestampDrift: initialTimestampDrift) {
                 onStageChange(.verifying, "원본 정보 변경 확인 중 (내용 재확인)")
                 onProgress(0, "원본 재확인 중")
                 driftProof = try LocalPublicationManager.proveSourceTimestampDrift(
