@@ -650,13 +650,17 @@ enum LocalConversionWorker {
 
             let sourceFD = lock.fd
             let expectedIdentity = lock.identity
+            var copyWasRetried = false
             let (sourceSha256, copiedBytes, timesChangedDuringCopy) = try await { () async throws -> (String, Int64, Bool) in
                 onStageChange(.copyingSource, "원본 임시 복사 중")
 
-                let copy = try LocalSourceCopier.copy(
-                    sourceFD: sourceFD, to: sourceDestURL, fileSize: fileSize,
+                // A byte-count discrepancy with an unchanged dev/inode/size is retried once on the same descriptor; the checks below
+                // are unchanged and still require the exact byte count.
+                let copy = try LocalSourceCopier.copyRetryingSizeMismatch(
+                    sourceFD: sourceFD, to: sourceDestURL, fileSize: fileSize, expected: expectedIdentity,
                     onProgress: { fraction, label in onProgress(fraction, label) }
                 )
+                copyWasRetried = copy.retried
                 let sha = copy.sha256
                 let copied = copy.copiedBytes
 
@@ -758,6 +762,7 @@ enum LocalConversionWorker {
                 claim: claim,
                 sourceSha256: sourceSha256,
                 driftProof: driftProof,
+                retentionIntent: copyWasRetried ? .copySizeRetry : nil,
                 verifyParentPinned: verifyParentPinned,
                 onCopyProgress: { fraction in
                     onProgress(fraction, "완료본 저장 중")

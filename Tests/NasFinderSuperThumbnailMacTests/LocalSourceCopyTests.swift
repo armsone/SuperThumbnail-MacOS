@@ -200,4 +200,82 @@ final class LocalSourceCopyTests: XCTestCase {
         XCTAssertEqual(again, wrapped.localizedDescription)
         XCTAssertEqual(again.components(separatedBy: "[진단:").count - 1, 1, again)
     }
+
+    // MARK: size-mismatch retry
+
+    private func identity() throws -> LocalFileIdentity { try LocalFileIdentity.inspect(fd: sourceFD) }
+
+    private func retryCopy(_ hooks: LocalSourceCopier.Hooks, expected: LocalFileIdentity, inspect: ((Int32) throws -> LocalFileIdentity)? = nil) throws -> (sha256: String, copiedBytes: Int64, retried: Bool) {
+        try LocalSourceCopier.copyRetryingSizeMismatch(
+            sourceFD: sourceFD, to: destURL, fileSize: Int64(payload.count), expected: expected,
+            inspect: inspect ?? { try LocalFileIdentity.inspect(fd: $0) }, chunkSize: 300,
+            hooks: hooks, onProgress: { _, _ in }
+        )
+    }
+
+    /// Hook returning `extra` additional bytes on the first pass's EOF read, so the first copy is too large.
+    private func excessOnFirstPass(_ extra: Int, passes: Int = 1) -> LocalSourceCopier.Hooks {
+        var hooks = LocalSourceCopier.Hooks()
+        var eofReads = 0
+        hooks.read = { fd, buffer, count in
+            let n = Darwin.read(fd, buffer, count)
+            if n == 0 {
+                eofReads += 1
+                if eofReads % 2 == 1, eofReads <= 2 * passes { memset(buffer, 0xAB, extra); return extra }
+            }
+            return n
+        }
+        return hooks
+    }
+
+    func testSizeMismatchRetriesOnceFromScratchAndMatchesExactly() throws {
+        let result = try retryCopy(excessOnFirstPass(5), expected: try identity())
+        XCTAssertTrue(result.retried)
+        XCTAssertEqual(result.copiedBytes, Int64(payload.count))
+        XCTAssertEqual(result.sha256, sha(payload))
+        XCTAssertEqual(try Data(contentsOf: destURL), payload)
+        try assertSourceIntact()
+    }
+
+    func testRepeatedSizeMismatchIsReturnedUnacceptedAfterOneRetry() throws {
+        let result = try retryCopy(excessOnFirstPass(5, passes: 2), expected: try identity())
+        XCTAssertTrue(result.retried)
+        XCTAssertEqual(result.copiedBytes, Int64(payload.count) + 5) // caller's exact-size guard rejects this
+        try assertSourceIntact()
+    }
+
+    func testNoRetryWhenIdentityChanged() throws {
+        let real = try identity()
+        let changed = LocalFileIdentity(device: real.device, inode: real.inode, size: real.size + 1, mtime: real.mtime, mtime_nsec: real.mtime_nsec, ctime: real.ctime, ctime_nsec: real.ctime_nsec)
+        let result = try retryCopy(excessOnFirstPass(5), expected: real, inspect: { _ in changed })
+        XCTAssertFalse(result.retried)
+        XCTAssertEqual(result.copiedBytes, Int64(payload.count) + 5)
+    }
+
+    func testNoRetryAndNoExtraReadOnMatchingSizeOrIOError() throws {
+        let script = ReadScript { _ in 0 }
+        let ok = try retryCopy(hooks(script), expected: try identity())
+        XCTAssertFalse(ok.retried)
+        XCTAssertEqual(script.calls, 5)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destURL.path)
+        let failing = ReadScript { call in call == 2 ? EIO : 0 }
+        XCTAssertThrowsError(try retryCopy(hooks(failing), expected: try identity()))
+        XCTAssertEqual(failing.calls, 2)
+    }
+
+    func testNonZeroOrFailedSeekStopsBeforeAnyCopy() throws {
+        // The offset is never assumed: a source that cannot seek to 0 (pipe) fails with a contextual I/O error and no copy is made.
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&fds), 0)
+        defer { close(fds[0]); close(fds[1]) }
+        var reads = 0
+        var hooks = LocalSourceCopier.Hooks()
+        hooks.read = { fd, buffer, count in reads += 1; return Darwin.read(fd, buffer, count) }
+        XCTAssertThrowsError(try LocalSourceCopier.copy(sourceFD: fds[0], to: destURL, fileSize: 1, hooks: hooks, onProgress: { _, _ in })) {
+            let text = $0.localizedDescription
+            XCTAssertTrue(text.contains("처음으로") && text.contains("원본 복사 시작 위치 설정"), text)
+        }
+        XCTAssertEqual(reads, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destURL.path))
+    }
 }

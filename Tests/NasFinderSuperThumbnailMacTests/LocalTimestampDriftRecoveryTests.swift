@@ -70,7 +70,7 @@ final class LocalTimestampDriftRecoveryTests: XCTestCase {
 
     private func publish(
         _ lock: LocalFileLock, _ claim: VideoConversionClaim, sha: String? = nil, proof: LocalSourceDriftProof? = nil,
-        attempt: String? = nil, assumeWebDAV: Bool = true,
+        attempt: String? = nil, assumeWebDAV: Bool = true, intent: LocalRetainedOriginalReason? = nil,
         onCopy: (@Sendable (Double) -> Void)? = nil, onRecheck: (@Sendable (Int64, Int64) -> Void)? = nil
     ) throws -> LocalPublishedMP4 {
         try LocalPublicationManager.publishMP4(
@@ -82,6 +82,7 @@ final class LocalTimestampDriftRecoveryTests: XCTestCase {
             claim: claim,
             sourceSha256: sha,
             driftProof: proof,
+            retentionIntent: intent,
             assumeWebDAVSource: assumeWebDAV,
             onCopyProgress: onCopy,
             onSourceRecheckProgress: onRecheck
@@ -271,6 +272,44 @@ final class LocalTimestampDriftRecoveryTests: XCTestCase {
         XCTAssertTrue(values.allSatisfy { $0.1 == Int64(big.count) && $0.0 > 0 && $0.0 <= $0.1 })
         XCTAssertEqual(values.map { $0.0 }, values.map { $0.0 }.sorted())
         XCTAssertEqual(values.last?.0, Int64(big.count))
+    }
+
+    func testCopySizeRetryIntentIsPersistedAndDeniesDeletion() async throws {
+        let (lock, claim) = try lockAndClaim()
+        let published = try publish(lock, claim, sha: sha256(sourceBytes), proof: nil, intent: .copySizeRetry)
+        XCTAssertEqual(published.record.retainedOriginalReason, .copySizeRetry)
+        // Persisted in the published journal; the encode/decode round trip keeps the distinct reason.
+        XCTAssertEqual(try readJournal("published").retainedOriginalReason, .copySizeRetry)
+        XCTAssertEqual(try readJournal("published"), published.record)
+        XCTAssertEqual(LocalRetainedOriginalReason(rawValue: "copy_size_retry"), .copySizeRetry)
+
+        let thumb = try await thumbnail(for: published, lock: lock)
+        XCTAssertThrowsError(try LocalPublicationManager.deleteVerifiedOriginal(
+            sourceLock: lock, published: published, thumbnail: thumb, attemptID: attemptID, claim: claim, verifyParentPinned: {}
+        )) { XCTAssertEqual(($0 as NSError).code, 55) }
+        try assertOriginalUntouched()
+    }
+
+    func testCopySizeRetryIntentIsNotATimestampProof() throws {
+        let (lock, claim) = try lockAndClaim()
+        setTimes("clip.avi", driftTime)
+        // Without a bound content proof (here no captured hash) a time difference is rejected exactly as for a normal attempt.
+        XCTAssertThrowsError(try publish(lock, claim, sha: nil, proof: nil, intent: .copySizeRetry)) {
+            XCTAssertEqual(($0 as NSError).code, 13)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path("clip.mp4").path))
+        try assertOriginalUntouched()
+    }
+
+    func testNormalAttemptStillMayDeleteTheVerifiedOriginal() async throws {
+        let (lock, claim) = try lockAndClaim()
+        let published = try publish(lock, claim, sha: sha256(sourceBytes), proof: nil)
+        XCTAssertNil(published.record.retainedOriginalReason)
+        let thumb = try await thumbnail(for: published, lock: lock)
+        try LocalPublicationManager.deleteVerifiedOriginal(
+            sourceLock: lock, published: published, thumbnail: thumb, attemptID: attemptID, claim: claim, verifyParentPinned: {}
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path("clip.avi").path))
     }
 
     func testRetainedMessageIsPlainLanguage() {

@@ -802,12 +802,16 @@ struct LocalJournalRecord: Codable, Equatable, Sendable {
 enum LocalRetainedOriginalReason: String, Codable, Sendable {
     /// The mount showed other mtime/ctime for the very same file (dev/inode/size equal); its bytes were re-proven by a full SHA-256.
     case sourceTimestampOnlyDrift = "source_timestamp_only_drift"
+    /// The copy needed the one-time byte-count retry. Retention only: it is NOT a timestamp/hash proof and relaxes no source check.
+    case copySizeRetry = "copy_size_retry"
 
     /// The one retained-only message shown to the user.
     var userMessage: String {
         switch self {
         case .sourceTimestampOnlyDrift:
             return "원본 보존 완료: 원본 파일 정보(시각)가 바뀌어 보였지만 내용이 같은 것을 확인했습니다. MP4·썸네일만 만들고 원본은 그대로 두었습니다."
+        case .copySizeRetry:
+            return "원본 보존 완료: 원본 복사 크기가 한 번 맞지 않아 다시 복사한 뒤 모든 검증을 통과했습니다. MP4·썸네일만 만들고 원본은 그대로 두었습니다."
         }
     }
 }
@@ -1081,6 +1085,7 @@ enum LocalPublicationManager {
         claim: VideoConversionClaim? = nil,
         sourceSha256: String? = nil,
         driftProof: LocalSourceDriftProof? = nil,
+        retentionIntent: LocalRetainedOriginalReason? = nil,
         verifyParentPinned: (() throws -> Void)? = nil,
         assumeWebDAVSource: Bool = false,
         onCopyProgress: (@Sendable (Double) -> Void)? = nil,
@@ -1137,7 +1142,8 @@ enum LocalPublicationManager {
                 throw conversionError(75, "원본 시각 변동 증명이 이 원본·클레임·시도와 맞지 않아 발행하지 않습니다 (원본 보존).")
             }
         }
-        var retainedReason: LocalRetainedOriginalReason? = driftProof == nil ? nil : .sourceTimestampOnlyDrift
+        // `retentionIntent` only makes the attempt retained-only; it is never a proof and `requireSource` ignores it.
+        var retainedReason: LocalRetainedOriginalReason? = driftProof == nil ? retentionIntent : .sourceTimestampOnlyDrift
         // The newest content proof of this publication (the caller's, or one made here). It is reused ONLY while the descriptor
         // AND the directory entry still show exactly (every field) what it observed; any other state re-hashes the original.
         var currentProof = driftProof
@@ -1314,7 +1320,7 @@ enum LocalPublicationManager {
             let currentEntryIdentity = try? LocalFileIdentity.inspect(dirFD: dirFD, name: originalFileName)
             // Retained-only: the bytes were just re-proven, so the same dev/inode/size is the same unchanged source here.
             func sourceUnchanged(_ identity: LocalFileIdentity?) -> Bool {
-                identity == sourceLock.identity || (retainedReason != nil && identity?.isSameFile(as: sourceLock.identity) == true)
+                identity == sourceLock.identity || (retainedReason == .sourceTimestampOnlyDrift && identity?.isSameFile(as: sourceLock.identity) == true)
             }
 
             if stagedStillPresent,
@@ -2265,7 +2271,7 @@ enum LocalCrashRecovery {
                     return "이전 완료본 스테이징 중단 기록 발견 (보존됨): 원본 '\(record.originalFileName)'은 그대로입니다."
                 case .outputPublished:
                     return "이전 변환에서 MP4 '\(record.finalFileName)'는 발행되었으나 썸네일 생성/원본 정리가 끝나지 않았습니다. 원본 '\(record.originalFileName)'은 보존되어 있으며 자동 삭제하지 않습니다 (수동 확인 필요)."
-                        + (record.retainedOriginalReason == nil ? "" : " (원본 시각만 바뀐 것을 확인한 보존 전용 기록)")
+                        + (record.retainedOriginalReason == nil ? "" : record.retainedOriginalReason == .copySizeRetry ? " (복사 재시도 보존 전용 기록)" : " (원본 시각만 바뀐 것을 확인한 보존 전용 기록)")
                 case .deletionStarted:
                     if originalExists {
                         return "이전 변환의 원본 삭제 시작 기록이 있으나 원본 '\(record.originalFileName)'이 남아 있습니다 (보존됨, 수동 확인 필요)."
