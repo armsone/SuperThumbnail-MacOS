@@ -411,6 +411,52 @@ final class LocalRecoveryScopeTests: XCTestCase {
         XCTAssertEqual(admit([changed]).map(\.identity), [changed.identity])
     }
 
+    // MARK: Same-path exclusion after a failure in this run
+
+    private func key(_ f: LocalDiscoveredFile) -> String {
+        LocalConversionCoordinator.pathKey(folderID: f.folderID, components: f.relativeComponents)
+    }
+
+    func testDriftedCopyOfFailedOriginalIsNotAdmittedAgainInThisRun() {
+        let folder = UUID()
+        let failed = synthetic(folder, ["Caution", "ILOVEASHLYNN#2.avi"], mtime: 100)
+        let drifted = synthetic(folder, ["Caution", "ILOVEASHLYNN#2.avi"], mtime: 400, inode: 9)
+        XCTAssertNotEqual(failed.identity, drifted.identity)
+        let admitted = LocalConversionCoordinator.admitFeedCandidates(
+            [drifted], active: [], activePaths: [], failed: [failed.identity], failedPaths: [key(failed)], pending: []
+        )
+        XCTAssertTrue(admitted.isEmpty)
+    }
+
+    func testPendingDuplicateQueuedBeforeTheFailureIsDroppedWithoutTouchingOthers() {
+        let folder = UUID()
+        let failed = synthetic(folder, ["Caution", "HHH", "episode1.wmv"], mtime: 100)
+        let duplicate = synthetic(folder, ["Caution", "HHH", "episode1.wmv"], mtime: 300, inode: 8)
+        let sibling = synthetic(folder, ["Caution", "HHH", "episode2.wmv"], inode: 9)
+        let otherFolder = synthetic(UUID(), ["Caution", "HHH", "episode1.wmv"], inode: 10)
+        let kept = LocalConversionCoordinator.removingPendingPaths([key(failed)], from: [duplicate, sibling, otherFolder])
+        XCTAssertEqual(kept.map(\.identity), [sibling.identity, otherFolder.identity])
+        // nothing failed: the queue is returned unchanged
+        XCTAssertEqual(LocalConversionCoordinator.removingPendingPaths([], from: [duplicate, sibling]).count, 2)
+    }
+
+    func testFailedPathIsAdmittedAgainOnTheNextRunAndDistinctPathsAreNeverBlocked() {
+        let folder = UUID()
+        let failed = synthetic(folder, ["Caution", "episode1.wmv"], mtime: 100)
+        let drifted = synthetic(folder, ["Caution", "episode1.wmv"], mtime: 200)
+        let sibling = synthetic(folder, ["Caution", "episode2.wmv"], inode: 8)
+        let caseDiffers = synthetic(folder, ["Caution", "Episode1.wmv"], inode: 9)
+        let otherFolder = synthetic(UUID(), ["Caution", "episode1.wmv"], inode: 11)
+        func admitWith(failedPaths: Set<String>) -> [String] {
+            LocalConversionCoordinator.admitFeedCandidates(
+                [drifted, sibling, caseDiffers, otherFolder], active: [], activePaths: [], failed: [], failedPaths: failedPaths, pending: []
+            ).map(\.relativePath)
+        }
+        XCTAssertEqual(admitWith(failedPaths: [key(failed)]), ["Caution/episode2.wmv", "Caution/Episode1.wmv", "Caution/episode1.wmv"])
+        // next run: the per-run set is empty again, so the explicit retry is admitted
+        XCTAssertEqual(admitWith(failedPaths: []).count, 4)
+    }
+
     func testFeedOrderPutsPriorityFirstThenResumesWithoutInspectingAFileTwice() {
         let id = UUID()
         func t(_ n: String) -> LocalRetryTarget { LocalRetryTarget(folderID: id, components: ["D", n]) }

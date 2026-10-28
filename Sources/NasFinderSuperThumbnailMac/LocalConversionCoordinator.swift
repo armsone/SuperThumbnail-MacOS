@@ -912,6 +912,10 @@ final class LocalConversionCoordinator: ObservableObject {
     private var pendingCandidates: [LocalDiscoveredFile] = []
     private var currentRunGeneration: Int = 0
     private var failedIdentitiesInPass: Set<LocalFileIdentity> = []
+    /// Folder + relative path keys that failed in this run. WebDAV changes a file's timestamps while it is copied, so the same
+    /// file comes back with a new identity; the path is what stops a re-download/re-encode of a proven failure. Cleared at the
+    /// start of every run, so the next run (or an explicit retry) can try the path again.
+    private var failedPathsInPass: Set<String> = []
     /// Remaining incremental inspections (priority retries, then known published-MP4 resumes) of the unified start. It counts as
     /// pending work: the run cannot finish while it exists.
     private var priorityFeed: PriorityFeed?
@@ -1455,11 +1459,12 @@ final class LocalConversionCoordinator: ObservableObject {
     }
 
     /// Candidates the feeder or the folder scan may add: not active (same identity OR same path, because WebDAV may change the
-    /// timestamps of a file that is already being copied), not already failed in this pass, not already queued (same identity or
-    /// path), and not repeated inside the batch itself. Nothing is remembered across runs, so the next run can retry a path.
+    /// timestamps of a file that is already being copied), not already failed in this pass (same identity OR same path, for the
+    /// same reason), not already queued (same identity or path), and not repeated inside the batch itself. Nothing is remembered
+    /// across runs, so the next run can retry a path.
     nonisolated static func admitFeedCandidates(
         _ candidates: [LocalDiscoveredFile], active: Set<LocalFileIdentity>, activePaths: Set<String>,
-        failed: Set<LocalFileIdentity>, pending: [LocalDiscoveredFile]
+        failed: Set<LocalFileIdentity>, failedPaths: Set<String> = [], pending: [LocalDiscoveredFile]
     ) -> [LocalDiscoveredFile] {
         func key(_ c: LocalDiscoveredFile) -> String { pathKey(folderID: c.folderID, components: c.relativeComponents) }
         var seenKeys = Set(pending.map(key))
@@ -1467,12 +1472,19 @@ final class LocalConversionCoordinator: ObservableObject {
         var admitted: [LocalDiscoveredFile] = []
         for candidate in candidates
         where !active.contains(candidate.identity) && !activePaths.contains(key(candidate)) && !failed.contains(candidate.identity)
+            && !failedPaths.contains(key(candidate))
             && !seenIdentities.contains(candidate.identity) && !seenKeys.contains(key(candidate)) {
             seenKeys.insert(key(candidate))
             seenIdentities.insert(candidate.identity)
             admitted.append(candidate)
         }
         return admitted
+    }
+
+    /// Drops queued-but-not-started entries whose path just failed (queued before the failure, with other timestamps). They are
+    /// not counted as discovered until they start, so removing them leaves every counter untouched; active tasks are never touched.
+    nonisolated static func removingPendingPaths(_ failedPaths: Set<String>, from pending: [LocalDiscoveredFile]) -> [LocalDiscoveredFile] {
+        pending.filter { !failedPaths.contains(pathKey(folderID: $0.folderID, components: $0.relativeComponents)) }
     }
 
     /// Single admission point on the MainActor for both the priority feeder and the folder-scan pull (the scan can reach a path
@@ -1483,6 +1495,7 @@ final class LocalConversionCoordinator: ObservableObject {
             active: Set(activeItems.map(\.identity)),
             activePaths: Set(activeItems.map { Self.pathKey(folderID: $0.folderID, components: $0.relativeComponents) }),
             failed: failedIdentitiesInPass,
+            failedPaths: failedPathsInPass,
             pending: pendingCandidates
         )
     }
@@ -1650,6 +1663,7 @@ final class LocalConversionCoordinator: ObservableObject {
         priorityFeed = feed
         priorityFeed?.generation = currentRunGeneration
         failedIdentitiesInPass.removeAll()
+        failedPathsInPass.removeAll()
         isTargetedRetry = false
         targetedTotal = 0
 
@@ -1669,6 +1683,7 @@ final class LocalConversionCoordinator: ObservableObject {
         guard preflightConversionTools() else { return }
         currentRunGeneration += 1
         failedIdentitiesInPass.removeAll()
+        failedPathsInPass.removeAll()
         pendingCandidates = candidates
         targetedTotal = candidates.count
         isTargetedRetry = true
@@ -1939,6 +1954,14 @@ final class LocalConversionCoordinator: ObservableObject {
         case .failed(let msg):
             counters.failedCount += 1
             failedIdentitiesInPass.insert(candidate.identity)
+            let failedKey = Self.pathKey(folderID: candidate.folderID, components: candidate.relativeComponents)
+            failedPathsInPass.insert(failedKey)
+            let remaining = Self.removingPendingPaths([failedKey], from: pendingCandidates)
+            if remaining.count != pendingCandidates.count {
+                // A targeted retry's denominator is its explicit list: shrink it with the dropped duplicates.
+                if isTargetedRetry { targetedTotal -= pendingCandidates.count - remaining.count }
+                pendingCandidates = remaining
+            }
             updateItemStage(itemID, stage: .failed(msg), message: "오류: \(msg)")
         case .skipped(let msg):
             counters.skippedCount += 1
