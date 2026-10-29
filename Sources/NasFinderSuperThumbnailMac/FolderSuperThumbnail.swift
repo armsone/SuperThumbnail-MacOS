@@ -24,26 +24,26 @@ struct FolderProcessingResult: Sendable {
     let usedChildFolderSheetCount: Int
 }
 
-/// One tile of the 3x3 contact sheet, in deterministic browser order.
-struct FolderSheetChild: Equatable, Sendable {
+/// One candidate tile of the 3x3 contact sheet.
+struct FolderSheetChild: Equatable, Hashable, Sendable {
     let name: String
     let isDirectory: Bool
 }
 
-/// Deterministic selection for the 3x3 contact sheet: visible children only,
-/// folders first, then localized standard name order — the same default
-/// ordering the NasFinder browser uses. At most 9 tiles.
+/// Selection helper for the 3x3 contact sheet: visible children only,
+/// mixed (shuffled) order so candidates are sampled across the folder
+/// instead of taking the first 9 alphabetically. At most 9 tiles.
 enum FolderContactSheetPlanner {
     static let maximumTileCount = 9
 
+    /// Visible candidates in mixed (shuffled) order for lazy artwork evaluation.
+    static func candidates(from children: [FolderSheetChild]) -> [FolderSheetChild] {
+        children.filter { !$0.name.hasPrefix(".") }.shuffled()
+    }
+
+    /// Mixed candidate selection capped at maximumTileCount.
     static func plan(children: [FolderSheetChild]) -> [FolderSheetChild] {
-        let visible = children.filter { !$0.name.hasPrefix(".") }
-        let ordered = visible.sorted { lhs, rhs in
-            if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-            let name = lhs.name.localizedStandardCompare(rhs.name)
-            return name == .orderedAscending
-        }
-        return Array(ordered.prefix(maximumTileCount))
+        Array(candidates(from: children).prefix(maximumTileCount))
     }
 }
 
@@ -278,15 +278,37 @@ extension VaultProcessor {
         defer { try? fileManager.removeItem(at: claim) }
 
         var usedChildFolderSheets = 0
-        let tiles = FolderContactSheetPlanner.plan(children: children).map { child in
-            tileImage(
-                for: child,
-                in: folder.url,
-                maxPixelSize: tilePixelSize,
-                tileCache: tileCache,
-                usedChildFolderSheets: &usedChildFolderSheets
+        let tiles = try collectTiles(
+            for: children,
+            in: folder.url,
+            maxPixelSize: tilePixelSize,
+            tileCache: tileCache,
+            usedChildFolderSheets: &usedChildFolderSheets
+        )
+
+        if tiles.isEmpty {
+            try Task.checkCancellation()
+            let marker = try JSONEncoder().encode(
+                FolderEmptyMarker(engine: NasFinderVaultCompatibility.engineVersion)
+            )
+            try marker.write(to: markerURL, options: .atomic)
+            try? fileManager.removeItem(at: sheetURL)
+            if let tileCache {
+                tileCache.removeTile(for: folder.url)
+                for child in children where child.isDirectory {
+                    tileCache.removeTile(
+                        for: folder.url.appendingPathComponent(child.name, isDirectory: true)
+                    )
+                }
+            }
+            return FolderProcessingResult(
+                state: .emptyIndexed,
+                thumbnailBytes: 0,
+                didBlur: false,
+                usedChildFolderSheetCount: 0
             )
         }
+
         try Task.checkCancellation()
         let unblurredSheet = try composeSheet(tiles: tiles, side: sheetPixelSize)
         if let tileCache {
@@ -386,6 +408,33 @@ extension VaultProcessor {
         }
     }
 
+    private static func collectTiles(
+        for children: [FolderSheetChild],
+        in folderURL: URL,
+        maxPixelSize: Int,
+        tileCache: FolderSheetTileCache?,
+        usedChildFolderSheets: inout Int
+    ) throws -> [CGImage] {
+        let candidates = FolderContactSheetPlanner.candidates(from: children)
+        var tiles: [CGImage] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+            if tiles.count >= FolderContactSheetPlanner.maximumTileCount {
+                break
+            }
+            if let tile = tileImage(
+                for: candidate,
+                in: folderURL,
+                maxPixelSize: maxPixelSize,
+                tileCache: tileCache,
+                usedChildFolderSheets: &usedChildFolderSheets
+            ) {
+                tiles.append(tile)
+            }
+        }
+        return tiles
+    }
+
     private static func tileImage(
         for child: FolderSheetChild,
         in folder: URL,
@@ -395,18 +444,21 @@ extension VaultProcessor {
     ) -> CGImage? {
         if child.isDirectory {
             let childURL = folder.appendingPathComponent(child.name, isDirectory: true)
+            guard tileCache?.tile(for: childURL) != nil || tileArtworkURL(for: child, in: folder) != nil else {
+                return nil
+            }
             guard let tile = unblurredFolderTile(
                 for: childURL,
                 maxPixelSize: maxPixelSize,
                 tileCache: tileCache
             ) else {
-                return placeholderTile(isDirectory: true, side: maxPixelSize)
+                return nil
             }
             usedChildFolderSheets += 1
             return tile
         }
         guard let artworkURL = tileArtworkURL(for: child, in: folder) else {
-            return placeholderTile(isDirectory: false, side: maxPixelSize)
+            return nil
         }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -416,7 +468,7 @@ extension VaultProcessor {
         guard let source = CGImageSourceCreateWithURL(artworkURL as CFURL, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
         else {
-            return placeholderTile(isDirectory: false, side: maxPixelSize)
+            return nil
         }
         return image
     }
@@ -425,7 +477,7 @@ extension VaultProcessor {
     /// in `tileCache` before its own blur; otherwise rebuilds a mini sheet
     /// from the child's unblurred sources (file thumbnails and, recursively,
     /// its own child folders). Returns `nil` for unreadable or empty folders
-    /// so the caller draws a placeholder.
+    /// so the caller skips them without consuming a tile slot.
     static func unblurredFolderTile(
         for folderURL: URL,
         maxPixelSize: Int,
@@ -438,14 +490,14 @@ extension VaultProcessor {
               !children.isEmpty else { return nil }
         var nestedFolderSheets = 0
         let nestedSide = max(maxPixelSize / 3, 1)
-        let tiles = FolderContactSheetPlanner.plan(children: children).map { child in
-            tileImage(
-                for: child,
-                in: folderURL,
-                maxPixelSize: nestedSide,
-                tileCache: tileCache,
-                usedChildFolderSheets: &nestedFolderSheets
-            )
+        guard let tiles = try? collectTiles(
+            for: children,
+            in: folderURL,
+            maxPixelSize: nestedSide,
+            tileCache: tileCache,
+            usedChildFolderSheets: &nestedFolderSheets
+        ), !tiles.isEmpty else {
+            return nil
         }
         guard let sheet = try? composeSheet(tiles: tiles, side: maxPixelSize) else {
             return nil
@@ -471,45 +523,7 @@ extension VaultProcessor {
         return context.makeImage()
     }
 
-    private static func placeholderTile(isDirectory: Bool, side: Int) -> CGImage? {
-        guard let context = CGContext(
-            data: nil,
-            width: side,
-            height: side,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        let background = isDirectory
-            ? CGColor(red: 0.88, green: 0.93, blue: 0.99, alpha: 1)
-            : CGColor(red: 0.94, green: 0.94, blue: 0.95, alpha: 1)
-        context.setFillColor(background)
-        context.fill(CGRect(x: 0, y: 0, width: side, height: side))
-
-        let symbolName = isDirectory ? "folder.fill" : "doc.fill"
-        let tint = isDirectory
-            ? NSColor(calibratedRed: 0.28, green: 0.56, blue: 0.92, alpha: 1)
-            : NSColor(calibratedWhite: 0.62, alpha: 1)
-        if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
-            .withSymbolConfiguration(
-                NSImage.SymbolConfiguration(pointSize: CGFloat(side) * 0.38, weight: .semibold)
-                    .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-            ) {
-            let previous = NSGraphicsContext.current
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
-            let symbolSize = symbol.size
-            let origin = CGPoint(
-                x: (CGFloat(side) - symbolSize.width) / 2,
-                y: (CGFloat(side) - symbolSize.height) / 2
-            )
-            symbol.draw(in: CGRect(origin: origin, size: symbolSize))
-            NSGraphicsContext.current = previous
-        }
-        return context.makeImage()
-    }
-
-    private static func composeSheet(tiles: [CGImage?], side: Int) throws -> CGImage {
+    private static func composeSheet(tiles: [CGImage], side: Int) throws -> CGImage {
         let cellSide = CGFloat(side) / 3
         guard let context = CGContext(
             data: nil,
@@ -525,7 +539,6 @@ extension VaultProcessor {
         context.interpolationQuality = .medium
 
         for (index, tile) in tiles.enumerated() where index < 9 {
-            guard let tile else { continue }
             let column = index % 3
             let row = index / 3
             // Core Graphics origin is bottom-left; the first child appears in

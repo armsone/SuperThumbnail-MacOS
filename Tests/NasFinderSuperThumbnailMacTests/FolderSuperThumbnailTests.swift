@@ -53,21 +53,21 @@ final class FolderSuperThumbnailTests: XCTestCase {
             FolderSheetChild(name: "alpha.jpg", isDirectory: false),
         ]
         let plan = FolderContactSheetPlanner.plan(children: children)
-        XCTAssertEqual(plan, [
-            FolderSheetChild(name: "2 여행", isDirectory: true),
-            FolderSheetChild(name: "10 여행", isDirectory: true),
-            FolderSheetChild(name: "alpha.jpg", isDirectory: false),
-            FolderSheetChild(name: "zeta.mp4", isDirectory: false),
-        ])
+        XCTAssertEqual(plan.count, 4)
+        XCTAssertFalse(plan.contains { $0.name.hasPrefix(".") })
+        XCTAssertEqual(
+            Set(plan.map(\.name)),
+            Set(["2 여행", "10 여행", "alpha.jpg", "zeta.mp4"])
+        )
 
         let many = (1...12).map {
             FolderSheetChild(name: "file-\($0).jpg", isDirectory: false)
         }
-        XCTAssertEqual(FolderContactSheetPlanner.plan(children: many).count, 9)
-        XCTAssertEqual(
-            FolderContactSheetPlanner.plan(children: many),
-            FolderContactSheetPlanner.plan(children: many.shuffled())
-        )
+        let manyPlan = FolderContactSheetPlanner.plan(children: many)
+        XCTAssertEqual(manyPlan.count, 9)
+        XCTAssertEqual(Set(manyPlan.map(\.name)).count, 9)
+        let manyNames = Set(many.map(\.name))
+        XCTAssertTrue(manyPlan.allSatisfy { manyNames.contains($0.name) })
     }
 
     func testDiscoverFoldersStaysInsideRootAndOrdersDeepestFirst() throws {
@@ -215,14 +215,13 @@ final class FolderSuperThumbnailTests: XCTestCase {
         let parent = root.appendingPathComponent("parent", isDirectory: true)
         let child = parent.appendingPathComponent("child", isDirectory: true)
         try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
-        // 5 skin-tone tiles (> 20% of the sheet) and 4 near-black tiles give
-        // the child sheet a blur and strong edges between neighbouring tiles.
-        var sources: [(String, (Double, Double, Double))] = []
-        for index in 1...4 { sources.append(("dark-\(index).png", (0.02, 0.02, 0.02))) }
-        for index in 1...5 { sources.append(("skin-\(index).png", (0.78, 0.47, 0.35))) }
-        for (name, color) in sources {
+        // Nine identical sources, each a near-black left quarter beside a
+        // skin-tone right three quarters: the child sheet is > 20% skin tone
+        // (blurred) with strong edges, whatever order the tiles are shuffled in.
+        let sources = (1...9).map { "split-\($0).png" }
+        for name in sources {
             let imageURL = child.appendingPathComponent(name)
-            try makePNG(color: color).write(to: imageURL)
+            try makePNG(color: (0.78, 0.47, 0.35), darkLeftFraction: 0.25).write(to: imageURL)
             let values = try imageURL.resourceValues(forKeys: [.fileSizeKey])
             _ = try await VaultProcessor.process(
                 MediaFile(url: imageURL, kind: .image, size: Int64(values.fileSize ?? 0)),
@@ -379,7 +378,8 @@ final class FolderSuperThumbnailTests: XCTestCase {
     }
 
     private func makePNG(
-        color: (Double, Double, Double)
+        color: (Double, Double, Double),
+        darkLeftFraction: Double = 0
     ) throws -> Data {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
@@ -395,6 +395,10 @@ final class FolderSuperThumbnailTests: XCTestCase {
             CGColor(red: color.0, green: color.1, blue: color.2, alpha: 1)
         )
         context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+        if darkLeftFraction > 0 {
+            context.setFillColor(CGColor(red: 0.02, green: 0.02, blue: 0.02, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: 32 * darkLeftFraction, height: 32))
+        }
         guard let image = context.makeImage() else { throw VaultProcessorError.cannotEncode }
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
