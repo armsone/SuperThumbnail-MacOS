@@ -94,12 +94,12 @@ work_dir="$(mktemp -d "${dist_dir}/.package.XXXXXX")"
 
 # ---------- 함수 ----------
 notarize() {
-  local artifact="$1" result="${work_dir}/notary-$2.json" status
+  local artifact="$1" result="${work_dir}/notary-$2.json" nstatus
   xcrun notarytool submit "${artifact}" --keychain-profile "${notary_profile}" --wait --output-format json > "${result}"
-  status="$(/usr/bin/plutil -extract status raw -o - "${result}")"
-  if [[ "${status}" != "Accepted" ]]; then
+  nstatus="$(/usr/bin/plutil -extract status raw -o - "${result}")"
+  if [[ "${nstatus}" != "Accepted" ]]; then
     /usr/bin/plutil -p "${result}" >&2
-    fail "Apple 공증이 거부되었거나 완료되지 않았습니다(${status}): $2. 제출 ID로 'xcrun notarytool log'를 확인하세요."
+    fail "Apple 공증이 거부되었거나 완료되지 않았습니다(${nstatus}): $2. 제출 ID로 'xcrun notarytool log'를 확인하세요."
   fi
   print "공증 승인: $2"
 }
